@@ -163,12 +163,16 @@ export class OrbitControls {
 
     c.addEventListener('pointerdown', (e) => {
       c.setPointerCapture(e.pointerId);
-      this._pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, button: e.button, shift: e.shiftKey });
+      this._pointers.set(e.pointerId, {
+        x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY,
+        button: e.button, shift: e.shiftKey,
+      });
       this._interact();
       this.velYaw = 0; this.velPitch = 0;
       if (this._pointers.size === 2) {
         const [a, b] = [...this._pointers.values()];
         this._pinchDist = Math.hypot(a.x - b.x, a.y - b.y);
+        this._lastTap.t = -1e9; // multi-touch is never a tap
       }
       // double-tap / double-click detection
       if (this._pointers.size === 1) {
@@ -188,6 +192,8 @@ export class OrbitControls {
       const p = this._pointers.get(e.pointerId);
       if (!p) return;
       const dx = e.clientX - p.x, dy = e.clientY - p.y;
+      // a drag is not a tap: a flick-flick must not fire an accidental pick
+      if (Math.hypot(e.clientX - p.x0, e.clientY - p.y0) > 12) this._lastTap.t = -1e9;
 
       if (this._pointers.size === 1) {
         const pan = p.button === 2 || p.shift;
@@ -228,9 +234,32 @@ export class OrbitControls {
 
     c.addEventListener('contextmenu', (e) => e.preventDefault());
 
-    // iOS Safari page-zoom gestures
+    // Safari (macOS trackpad / iPadOS) reports pinch as proprietary
+    // GestureEvents with e.scale — it does NOT synthesize wheel+ctrlKey like
+    // Chromium/Firefox. Map them to dolly; skip while a real two-pointer
+    // pinch is active (iPadOS direct touch can fire both).
+    this._gestureScale = 1;
+    c.addEventListener('gesturestart', (e) => {
+      e.preventDefault();
+      this._interact();
+      this._gestureScale = e.scale || 1;
+    });
+    c.addEventListener('gesturechange', (e) => {
+      e.preventDefault();
+      if (this._pointers.size >= 2) return;
+      if (e.scale > 0 && this._gestureScale > 0) {
+        this._applyDolly(this._gestureScale / e.scale);
+        this.onChange();
+      }
+      this._gestureScale = e.scale || this._gestureScale;
+    });
+    c.addEventListener('gestureend', (e) => {
+      e.preventDefault();
+      this._gestureScale = 1;
+    });
+    // pinches starting on the UI overlay must not zoom the page either
     for (const ev of ['gesturestart', 'gesturechange', 'gestureend']) {
-      c.addEventListener(ev, (e) => e.preventDefault());
+      document.addEventListener(ev, (e) => e.preventDefault());
     }
     c.addEventListener('dblclick', (e) => e.preventDefault());
   }

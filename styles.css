@@ -75,6 +75,7 @@ html, body {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 #hint {
+  pointer-events: none; /* purely informational — must never swallow taps */
   position: absolute;
   left: 50%;
   transform: translateX(-50%);

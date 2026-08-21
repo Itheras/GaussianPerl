@@ -44,8 +44,30 @@ export class SplatRenderer {
     });
     if (!gl) throw new Error('WebGL2 not available');
     this.gl = gl;
+    this.contextLost = false;
+    this.onContextLost = null;
+    this.onContextRestored = null;
 
-    // Float render targets: full float > half float > rgba8 (encoded depth)
+    // iOS Safari sheds GL contexts aggressively (backgrounding, memory
+    // pressure). preventDefault is REQUIRED or the context never restores.
+    canvas.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault();
+      this.contextLost = true;
+      if (this.onContextLost) this.onContextLost();
+    });
+    canvas.addEventListener('webglcontextrestored', () => {
+      this.contextLost = false;
+      this._initGL();
+      if (this.onContextRestored) this.onContextRestored(); // re-upload cloud
+    });
+
+    this._initGL();
+  }
+
+  _initGL() {
+    const gl = this.gl;
+    // Float render targets: full float > half float > rgba8 (encoded depth).
+    // Extensions must be re-queried after a context restore.
     if (gl.getExtension('EXT_color_buffer_float')) {
       this.rtFormat = gl.RGBA16F; this.rtType = gl.HALF_FLOAT; this.depthEncoded = false;
     } else if (gl.getExtension('EXT_color_buffer_half_float')) {
@@ -76,6 +98,7 @@ export class SplatRenderer {
 
     this.vaoEmpty = gl.createVertexArray(); // composite pass: no attribs
 
+    // after a context loss every old GL object is invalid — drop references
     this.texPos = null; this.texCovA = null; this.texCovB = null; this.texColor = null;
     this.count = 0;
     this.instanceCount = 0;
@@ -257,11 +280,13 @@ export class SplatRenderer {
   }
 
   render(state) {
+    if (this.contextLost) return;
     this._renderInto(state, null, this.canvas.width, this.canvas.height);
   }
 
-  /** Renders offscreen at up to `scale`x canvas size; returns {pixels, width, height} (top-down rows). */
+  /** Renders offscreen at up to `scale`x canvas size; returns {pixels, width, height} (top-down rows), or null if the GL context is lost. */
   capture(state, scale = 2) {
+    if (this.contextLost) return null;
     const gl = this.gl;
     const maxDim = 4096;
     let w = Math.round(this.canvas.width * scale);

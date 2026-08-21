@@ -12,11 +12,11 @@ export function workingSize(natW, natH, maxPixels) {
 }
 
 async function decodeToSource(blob) {
-  if (typeof createImageBitmap === 'function') {
-    try {
-      return await createImageBitmap(blob);
-    } catch { /* fall through to <img> (some formats/UAs) */ }
-  }
+  // <img> first: Safari's createImageBitmap(blob) IGNORES EXIF orientation
+  // (WebKit bug 237895) and succeeds anyway, so a try/catch can't save us —
+  // iPhone portrait photos would build sideways splats. The <img> path applies
+  // orientation correctly in every engine, and we rasterize to 2D right after,
+  // so ImageBitmap had no advantage here.
   const url = URL.createObjectURL(blob);
   try {
     const img = new Image();
@@ -24,6 +24,11 @@ async function decodeToSource(blob) {
     img.src = url;
     await img.decode();
     return img;
+  } catch {
+    if (typeof createImageBitmap === 'function') {
+      return await createImageBitmap(blob); // exotic formats <img> rejects
+    }
+    throw new Error('could not decode image');
   } finally {
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   }

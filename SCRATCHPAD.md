@@ -60,6 +60,43 @@ field with tap-to-focus), then **save a normal PNG** of the view you like.
 
 ## Milestone log
 
+### M6 — Adversarial review + fixes (DONE)
+- Ran a 28-agent multi-lens review (6 finders: safari-ios / gl-correctness /
+  math-pipeline / workers-async / touch-ux / memory-perf → dedupe → 1
+  adversarial verifier per finding). 22 findings → 21 confirmed, 1 refuted
+  (lowp-sampler; added `precision highp sampler2D` anyway, zero cost).
+- **Fixed (all verified by re-running unit + e2e suites):**
+  - `<img>`-first decode: Safari's createImageBitmap(blob) ignores EXIF
+    (WebKit bug 237895) and *succeeds*, so try/catch can't catch it — iPhone
+    portrait photos built sideways splats. `<img>`+decode() is correct
+    everywhere; ImageBitmap kept only as fallback for exotic formats.
+  - Safari GestureEvent pinch → dolly (macOS trackpad/iPadOS fire gesture*
+    with e.scale, NOT wheel+ctrlKey); document-level gesture preventDefault
+    so UI-chrome pinches don't zoom the page.
+  - webglcontextlost/restored: renderer._initGL() refactor + reinit;
+    main re-uploads cloud and re-sorts on restore (iOS sheds GL contexts).
+  - Sort races: onBuilt bumps sortGen + drops spareIdx (in-flight sort of the
+    OLD cloud must never index the new textures); sorted handler also checks
+    indices.length === cloud.count.
+  - openBlob/openSample load-token guard (concurrent opens mixed imageData
+    from one photo with disparity from another); ensureEstimator memoized.
+  - Export errors routed by msg.id==='export' before the buildId filter
+    (errors used to strand the Export button disabled forever).
+  - Worker onerror/onmessageerror wired; hint chip pointer-events:none
+    (it swallowed bottom-center taps for 8 s); double-tap invalidated by
+    drag >12px and by multi-touch; Lens slider now updates controls.fovY.
+  - DoF strength AND cap both scale with dpr (blur used to differ 1x vs 2x).
+  - snapDepthEdges threshold aligned to `jump` exactly (0.8j–1.0j steps were
+    steepened but then missed by every silhouette consumer).
+  - Memory/perf: onBuilt uses transferred buffers directly (was deep-copying
+    ~110 MB at 'high'); bg layer capacity counted exactly from bgMask (was
+    worst-case w*h ≈ +50 MB); pipeline worker stage-cache keyed by sourceId
+    (Depth slider now skips refine+inpaint, straight to buildSplats);
+    jointBilateral color weight via 2048-entry LUT (was ~35M Math.exp).
+- **Deferred (recorded, not bugs):** underlayer overdraw (~1–2 ms GPU,
+  inherent to the crack-filling design); inpaint at working res (one-time
+  cost, now cached); far-field terracing on the sample at extreme yaw.
+
 ### M5 — Tests + hardening (DONE)
 - 25 node unit tests (`node tests/run.mjs`): math, imageops, depthproc, inpaint,
   splat-build, .splat export, PNG encoder, sort-worker (simulated via

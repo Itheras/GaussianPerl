@@ -41,6 +41,7 @@ const app = {
   imageData: null,       // working-resolution ImageData of current source
   disparity: null,       // Float32Array at working res (ai/gt), or null (heuristic)
   disparityKind: 'none', // 'ai' | 'gt' | 'none'
+  sourceId: 0,           // bumps per opened image/quality; keys the worker's stage cache
   focusDist: 2,
   targetFocus: 2,
   buildId: 0,
@@ -59,7 +60,20 @@ const sortWorker = new Worker(new URL('./render/sort-worker.js', import.meta.url
 
 pipelineWorker.onmessage = (e) => {
   const msg = e.data;
-  if (msg.id !== app.buildId && msg.type !== 'exported') return; // stale build
+  // export replies (success OR error) are routed by their own id, never
+  // filtered by buildId — otherwise an export error strands the button
+  if (msg.id === 'export') {
+    if (msg.type === 'exported') {
+      downloadBlob(new Blob([msg.bytes], { type: 'application/octet-stream' }), 'gaussianperl.splat');
+      status('Saved .splat', false, 2500);
+    } else if (msg.type === 'error') {
+      console.error('export error:', msg.message);
+      status('Export failed', false, 4000);
+    }
+    $('btnExport').disabled = false;
+    return;
+  }
+  if (msg.id !== app.buildId) return; // stale build
   if (msg.type === 'progress') {
     const stageText = {
       normalize: 'Normalizing depth…', refine: 'Refining depth edges…',
@@ -69,27 +83,35 @@ pipelineWorker.onmessage = (e) => {
     status(stageText, true);
   } else if (msg.type === 'built') {
     onBuilt(msg);
-  } else if (msg.type === 'exported') {
-    downloadBlob(new Blob([msg.bytes], { type: 'application/octet-stream' }), 'gaussianperl.splat');
-    status('Saved .splat', false, 2500);
-    $('btnExport').disabled = false;
   } else if (msg.type === 'error') {
     console.error('pipeline error:', msg.message);
     status('Something went wrong building the splat', false, 5000);
-    $('btnExport').disabled = false;
   }
 };
+pipelineWorker.onerror = (e) => {
+  console.error('pipeline worker failed:', e.message || e);
+  status('Pipeline worker failed — reload the page', false, 8000);
+  $('btnExport').disabled = false;
+};
+pipelineWorker.onmessageerror = (e) => console.error('pipeline messageerror:', e);
 
 sortWorker.onmessage = (e) => {
   const msg = e.data;
   if (msg.type !== 'sorted') return;
   app.sortBusy = false;
-  if (msg.indices && msg.gen === app.sortGen) {
+  // gen must match AND the index count must match the current cloud —
+  // a sort of the previous cloud must never index the new one
+  if (msg.indices && msg.gen === app.sortGen &&
+      app.cloud && msg.indices.length === app.cloud.count) {
     renderer.setSortedIndices(msg.indices);
     app.spareIdx = msg.indices;
     app.needsRender = true;
   }
   maybeSort();
+};
+sortWorker.onerror = (e) => {
+  console.error('sort worker failed:', e.message || e);
+  app.sortBusy = false;
 };
 
 function requestSort() {
@@ -179,7 +201,7 @@ function kickBuild() {
   const transfer = [rgbaCopy.buffer];
   if (dispCopy) transfer.push(dispCopy.buffer);
   pipelineWorker.postMessage({
-    type: 'build', id: app.buildId,
+    type: 'build', id: app.buildId, sourceId: app.sourceId,
     rgba: rgbaCopy.buffer,
     w: app.imageData.width, h: app.imageData.height,
     disparity: dispCopy ? dispCopy.buffer : null,
@@ -188,17 +210,24 @@ function kickBuild() {
 }
 
 function onBuilt(msg) {
+  // buffers arrive TRANSFERRED from the worker — use them directly
+  // (new Float32Array(...) here would deep-copy ~110 MB at 'high')
   app.cloud = {
     count: msg.count,
-    positions: new Float32Array(msg.positions),
-    cov: new Float32Array(msg.cov),
-    colors: new Uint8Array(msg.colors),
+    positions: msg.positions,
+    cov: msg.cov,
+    colors: msg.colors,
   };
   app.meta = msg.meta;
+  // invalidate any in-flight sort of the previous cloud NOW — its reply must
+  // not index into the new textures
+  app.sortGen++;
+  app.spareIdx = null;
   renderer.setCloud(app.cloud);
+  const posCopy = app.cloud.positions.slice();
   sortWorker.postMessage(
-    { type: 'points', positions: app.cloud.positions.slice(), count: app.cloud.count },
-    []);
+    { type: 'points', positions: posCopy, count: app.cloud.count },
+    [posCopy.buffer]);
   controls.setHome(-msg.meta.centerZ, msg.meta.centerZ);
   app.targetFocus = app.focusDist = msg.meta.centerZ;
   syncFocusSlider();
@@ -220,60 +249,75 @@ function showHint() {
   setTimeout(() => { el.hidden = true; }, 7800);
 }
 
+let estimatorPromise = null; // memoized: concurrent calls must not double-load
 async function ensureEstimator() {
   if (urlParams.has('nomodel')) return null;
-  if (app.estimator !== undefined) return app.estimator;
-  status('Loading depth model (first time: ~25 MB)…', true);
-  app.estimator = await DepthEstimator.load(({ phase, pct }) => {
-    if (phase === 'download') {
-      status(`Downloading depth model… ${Math.round(pct * 100)}%`, true);
-    }
-  });
+  if (!estimatorPromise) {
+    status('Loading depth model (first time: ~25 MB)…', true);
+    estimatorPromise = DepthEstimator.load(({ phase, pct }) => {
+      if (phase === 'download') {
+        status(`Downloading depth model… ${Math.round(pct * 100)}%`, true);
+      }
+    });
+  }
+  app.estimator = await estimatorPromise;
   if (app.estimator) {
     $('modelInfo').textContent = `depth: Depth Anything V2 · ${app.estimator.backend}`;
   }
   return app.estimator;
 }
 
+// Every open flow takes a token; after each await, a newer token means the
+// user opened something else — abandon, never mix state from two images.
+let loadToken = 0;
+
 async function openBlob(blob) {
+  const token = ++loadToken;
   try {
     status('Reading photo…', true);
     const { imageData } = await loadImageBlob(blob, maxPixels());
-    app.source = { sample: false, blob };
-    app.imageData = imageData;
-
+    if (token !== loadToken) return;
     const est = await ensureEstimator();
+    if (token !== loadToken) return;
+    let disparity = null, kind = 'none';
     if (est) {
       status('Estimating depth (on-device AI)…', true);
       await new Promise((r) => setTimeout(r, 30)); // let the status paint
-      app.disparity = await est.estimate(imageData, imageData.width, imageData.height);
-      app.disparityKind = 'ai';
+      disparity = await est.estimate(imageData, imageData.width, imageData.height);
+      kind = 'ai';
+      if (token !== loadToken) return;
     } else {
-      app.disparity = null;
-      app.disparityKind = 'none';
       $('modelInfo').textContent = 'depth: heuristic (AI model unavailable)';
       status('AI model unavailable — using heuristic depth', true, 0);
     }
+    app.source = { sample: false, blob };
+    app.imageData = imageData;
+    app.disparity = disparity;
+    app.disparityKind = kind;
+    app.sourceId++;
     kickBuild();
   } catch (err) {
     console.error(err);
-    status('Could not open that image', false, 5000);
+    if (token === loadToken) status('Could not open that image', false, 5000);
   }
 }
 
 async function openSample() {
+  const token = ++loadToken;
   try {
     status('Loading sample…', true);
     const { imageData, disparity } = await loadSample(maxPixels());
+    if (token !== loadToken) return;
     app.source = { sample: true };
     app.imageData = imageData;
     app.disparity = disparity;
     app.disparityKind = 'gt';
+    app.sourceId++;
     $('modelInfo').textContent = 'depth: bundled ground truth';
     kickBuild();
   } catch (err) {
     console.error(err);
-    status('Could not load the sample', false, 5000);
+    if (token === loadToken) status('Could not load the sample', false, 5000);
   }
 }
 
@@ -351,14 +395,17 @@ const proj = new Float32Array(16);
 
 function renderState(w, h) {
   M4.perspective(settings.fovYDeg * Math.PI / 180, w / Math.max(h, 1), 0.1, 300, proj);
-  const dof = settings.aperture * settings.aperture * 240;
+  // CoC is computed in render-target pixels: BOTH strength and cap must scale
+  // with dpr or blur strength varies between 1x and 2x displays
+  const px = Math.min(devicePixelRatio || 1, 2);
+  const dof = settings.aperture * settings.aperture * 240 * px;
   return {
     view: controls.viewMatrix(tmpView),
     proj,
     splatScale: settings.splatScale,
     focusDist: app.focusDist,
     dofStrength: dof,
-    maxCoC: DEFAULTS.maxCoC * Math.min(devicePixelRatio || 1, 2),
+    maxCoC: DEFAULTS.maxCoC * px,
     bgTop: DEFAULTS.bgTop,
     bgBottom: DEFAULTS.bgBottom,
   };
@@ -392,6 +439,20 @@ function onResize() {
 window.addEventListener('resize', onResize);
 if (window.visualViewport) visualViewport.addEventListener('resize', onResize);
 
+// iOS Safari sheds GL contexts under memory pressure — recover transparently
+renderer.onContextLost = () => status('Graphics context lost — recovering…', true);
+renderer.onContextRestored = () => {
+  if (app.cloud) {
+    renderer.setCloud(app.cloud);
+    app.sortGen++;
+    app.spareIdx = null;
+    app.lastSortView = null;
+    requestSort();
+  }
+  onResize();
+  status('Recovered', false, 2000);
+};
+
 // ---------- UI wiring ----------
 $('btnOpen').onclick = () => $('file').click();
 $('btnWelcomeOpen').onclick = () => $('file').click();
@@ -411,6 +472,7 @@ $('btnSave').onclick = async () => {
     status('Rendering PNG…', true);
     await new Promise((r) => requestAnimationFrame(r));
     const cap = renderer.capture(renderState(canvas.width, canvas.height), 2);
+    if (!cap) throw new Error('graphics context lost');
     await savePixelsAsPNG(cap.pixels, cap.width, cap.height, pngName());
     app.needsRender = true;
     status('Saved ✓', false, 2500);
@@ -458,6 +520,7 @@ $('sFocus').addEventListener('input', (e) => {
 });
 $('sFov').addEventListener('input', (e) => {
   settings.fovYDeg = parseFloat(e.target.value);
+  controls.fovY = settings.fovYDeg * Math.PI / 180; // keeps pan scale pixel-true
   app.needsRender = true;
 });
 $('selQuality').value = settings.quality;

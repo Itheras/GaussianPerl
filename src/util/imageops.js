@@ -80,6 +80,8 @@ export function boxBlurFloat(src, w, h, radius) {
 
 // Joint bilateral filter: smooth `val` (Float32, single channel) guided by RGBA image.
 // Snaps value edges to color edges. sigmaColor in 0..255 luminance-ish units.
+// The color weight uses a 2048-entry LUT — the naive form costs ~35M Math.exp
+// calls on a 1.4MP image, ~1s of a phone core for no visible difference.
 export function jointBilateral(val, rgba, w, h, radius = 2, sigmaColor = 22, sigmaSpace = 2) {
   const dst = new Float32Array(w * h);
   const invS2 = 1 / (2 * sigmaSpace * sigmaSpace);
@@ -91,6 +93,14 @@ export function jointBilateral(val, rgba, w, h, radius = 2, sigmaColor = 22, sig
     for (let dx = -radius; dx <= radius; dx++) {
       sw[(dy + radius) * size + (dx + radius)] = Math.exp(-(dx * dx + dy * dy) * invS2);
     }
+  }
+  // Color-weight LUT over squared RGB distance [0, 3*255^2]
+  const LUT_N = 2048;
+  const maxD2 = 3 * 255 * 255;
+  const lutScale = (LUT_N - 1) / maxD2;
+  const lut = new Float32Array(LUT_N);
+  for (let i = 0; i < LUT_N; i++) {
+    lut[i] = Math.exp(-(i / lutScale) * invC2 / 3);
   }
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -104,7 +114,7 @@ export function jointBilateral(val, rgba, w, h, radius = 2, sigmaColor = 22, sig
           const ni = (yy * w + xx);
           const nc = ni * 4;
           const dr = rgba[nc] - r0, dg = rgba[nc + 1] - g0, db = rgba[nc + 2] - b0;
-          const cw = Math.exp(-(dr * dr + dg * dg + db * db) * invC2 / 3);
+          const cw = lut[((dr * dr + dg * dg + db * db) * lutScale) | 0];
           const wgt = sw[(dy + radius) * size + (dx + radius)] * cw;
           sum += val[ni] * wgt;
           wsum += wgt;

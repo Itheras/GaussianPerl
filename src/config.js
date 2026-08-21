@@ -13,9 +13,9 @@ export function defaultQuality() {
 
 // maxPixels: budget for the fine splat layer (≈ splat count before extras)
 export const QUALITY = {
-  low: { maxPixels: 380_000, inpaintScale: 0.5 },
-  medium: { maxPixels: 730_000, inpaintScale: 0.5 },
-  high: { maxPixels: 1_400_000, inpaintScale: 0.6 },
+  low: { maxPixels: 380_000 },
+  medium: { maxPixels: 730_000 },
+  high: { maxPixels: 1_400_000 },
 };
 
 export const DEFAULTS = {

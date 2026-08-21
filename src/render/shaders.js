@@ -132,6 +132,7 @@ void main() {
 
 export const COMPOSITE_FS = /* glsl */ `#version 300 es
 precision highp float;
+precision highp sampler2D;
 
 in vec2 vTex;
 out vec4 oColor;

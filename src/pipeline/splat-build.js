@@ -32,13 +32,18 @@ export function buildSplats({ rgba, w, h, disp, edges, bg, params }) {
 
   const depth = disparityToDepth(disp, params.zNear, params.zRange);
 
-  // capacity: fine + bg + underlayer + skirt (generous, trimmed at the end)
+  // capacity: fine + bg + underlayer + skirt (bg counted exactly — a
+  // worst-case w*h there would waste ~50 MB of peak memory on phones)
   const underStep = params.underStep ?? 4;
   const skirtPx = params.withSkirt ? (params.skirtPx ?? 24) : 0;
   const skirtCap = skirtPx > 0
     ? Math.ceil(((w + 2 * skirtPx) * (h + 2 * skirtPx) - w * h) / 4) + 16 : 0;
+  let bgCap = 0;
+  if (params.withBg && bg) {
+    for (let i = 0; i < w * h; i++) bgCap += bg.bgMask[i];
+  }
   const cap = w * h
-    + (params.withBg && bg ? w * h : 0)
+    + bgCap
     + (params.withUnder ? (Math.ceil(w / underStep) + 1) * (Math.ceil(h / underStep) + 1) : 0)
     + skirtCap;
 

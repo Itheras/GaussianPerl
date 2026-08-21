@@ -90,8 +90,11 @@ export function snapDepthEdges(disp, w, h, jump, iterations = 2) {
             if (v > hi) hi = v;
           }
         }
+        // threshold matches the > jump test used by edgeMask/fgBoundary/dz():
+        // anything we steepen into a step WILL be treated as a silhouette;
+        // anything below stays smooth for every consumer (no blind window)
         const d = cur[y * w + x];
-        out[y * w + x] = (hi - lo > jump * 0.8)
+        out[y * w + x] = (hi - lo > jump)
           ? ((d - lo < hi - d) ? lo : hi)
           : d;
       }
