@@ -1,9 +1,10 @@
 # GaussianPerl 🫧
 
 Turn a **single photo** into an interactive **3D Gaussian splat** — right on your
-device. No server, no upload: a local AI depth model runs in your browser
-(WebGPU or WASM), the missing parallax data is synthesized on-device, and the
-result renders as a real gaussian splat you can orbit, refocus, and capture.
+device. No server, no upload: local AI models run in your browser (WebGPU or
+WASM) — one estimates depth, another **generatively paints the areas the camera
+never saw** (behind foreground objects and beyond the frame) — and the result
+renders as a real gaussian splat you can orbit, refocus, and capture.
 
 Built for **Mac (M-series)** and **iPhone** — everything is plain WebGL2 + ES
 modules, one codebase, mouse *and* touch.
@@ -37,16 +38,19 @@ On iPhone: serve from your Mac (`python3 -m http.server`) and open
 
 | Stage | Trick |
 |---|---|
-| Depth | Depth Anything V2 (small) via transformers.js, on-device (WebGPU→WASM) |
+| Depth | Depth Anything V2 via transformers.js, on-device (WebGPU→WASM; *base* model on desktop WebGPU, *small* elsewhere) |
 | Depth cleanup | Joint bilateral filter guided by image color — edges snap to color edges |
+| Far field | Disparity tail compression: distant mountains/sky become a coherent backdrop (real far fields don't parallax) |
 | Splats | Per-pixel anisotropic gaussians oriented by depth-normals, slant-stretched |
 | Silhouettes | Depth-discontinuity mask → isotropic, alpha-feathered edge splats |
-| Hidden data | Layered disocclusion fill: background color+depth inpainted behind foreground silhouettes — revealed by parallax |
-| Image borders | Mirror-extended fading “skirt” so the frame edge doesn’t cut hard |
+| Hidden data | **Generative fill**: MI-GAN inpainting (28 MB ONNX, onnxruntime-web) paints the background revealed by parallax — foreground is masked out of the model's context so it can't smear into the hole |
+| Fill realism | Low frequencies anchored to the classical fill estimate (kills GAN hallucinations), variance grain on top |
+| Image borders | **Generative outpaint**: the same model extends the scene beyond the frame onto a padded plate skirt |
 | Cracks | ×4-downsampled large-splat underlayer |
 | Render | Instanced EWA splatting, worker counting-sort, premultiplied back-to-front |
 | Focus | DoF post-pass from per-pixel composited depth, tap-to-focus |
-| Offline | Bundled sample ships ground-truth depth; heuristic depth if the model can’t load |
+| Instant preview | Classical fill ships the first splat immediately; the AI-filled rebuild swaps in when ready |
+| Offline | Everything degrades gracefully: classical fill, mirrored skirt, heuristic depth — no network required |
 
 Details and per-milestone notes: [`SCRATCHPAD.md`](SCRATCHPAD.md).
 
@@ -58,8 +62,10 @@ styles.css
 src/main.js           bootstrap + UI wiring
 src/config.js         quality presets, tunables
 src/util/             math3d, imageops (pure, node-testable)
-src/pipeline/         depth-ai (transformers.js), depthproc, inpaint,
-                      splat-build, pipeline-worker
+src/pipeline/         depth-ai (transformers.js), inpaint-ai (MI-GAN via
+                      onnxruntime-web), fill-plan (masks/clusters/anchoring),
+                      depthproc, inpaint (classical), splat-build,
+                      pipeline-worker (owns both AI models)
 src/render/           WebGL2 renderer, shaders, sort-worker
 src/controls/         orbit controls (mouse + touch + inertia)
 src/io/               image load / PNG save / .splat export

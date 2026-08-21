@@ -3,8 +3,7 @@
 import { SplatRenderer } from './render/renderer.js';
 import { OrbitControls } from './controls/orbit.js';
 import { M4, clamp } from './util/math3d.js';
-import { QUALITY, DEFAULTS, defaultQuality } from './config.js';
-import { DepthEstimator } from './pipeline/depth-ai.js';
+import { QUALITY, DEFAULTS, defaultQuality, isMobile, isSafariEngine } from './config.js';
 import { loadImageBlob, loadSample, bindImageDrop } from './io/load.js';
 import { savePixelsAsPNG, downloadBlob } from './io/save.js';
 
@@ -32,6 +31,9 @@ const settings = {
   withBg: true,
   withSkirt: true,
   withUnder: true,
+  // nomodel = no AI at all (depth + fill); nofill = generative fill only
+  aiDepth: !urlParams.has('nomodel'),
+  aiFill: !urlParams.has('nomodel') && !urlParams.has('nofill'),
 };
 
 const app = {
@@ -39,27 +41,34 @@ const app = {
   meta: null,
   source: null,          // {sample:bool, blob?:Blob}
   imageData: null,       // working-resolution ImageData of current source
-  disparity: null,       // Float32Array at working res (ai/gt), or null (heuristic)
-  disparityKind: 'none', // 'ai' | 'gt' | 'none'
+  disparity: null,       // Float32Array at working res (gt), or null (worker estimates)
+  disparityKind: 'none', // 'ai' | 'gt' | 'none' — mirrored from build meta
   sourceId: 0,           // bumps per opened image/quality; keys the worker's stage cache
   focusDist: 2,
   targetFocus: 2,
   buildId: 0,
+  setupId: 0,            // last build id whose PREVIEW/first result set up the view
   needsRender: true,
   sortBusy: false,
   sortDirty: false,
   sortGen: 0,
   spareIdx: null,
   lastSortView: null,
-  estimator: undefined,  // undefined = not tried, null = unavailable
+  pendingCloud: null,    // final AI rebuild parked until its sort arrives
+  aiBroken: false,       // watchdog tripped pre-preview: ALL AI off this session
+  aiFillBroken: false,   // watchdog tripped mid-fill: only the fill off
+  workerDead: false,     // worker script itself failed — reload required
 };
 
 // ---------- workers ----------
-const pipelineWorker = new Worker(new URL('./pipeline/pipeline-worker.js', import.meta.url), { type: 'module' });
 const sortWorker = new Worker(new URL('./render/sort-worker.js', import.meta.url), { type: 'module' });
+let pipelineWorker = null;
 
-pipelineWorker.onmessage = (e) => {
+function onPipelineMessage(e) {
   const msg = e.data;
+  // any message proves the worker is alive — feed BEFORE all filtering
+  // (stale-build progress during a long wasm fill must not false-trip)
+  feedWatchdog();
   // export replies (success OR error) are routed by their own id, never
   // filtered by buildId — otherwise an export error strands the button
   if (msg.id === 'export') {
@@ -75,37 +84,109 @@ pipelineWorker.onmessage = (e) => {
   }
   if (msg.id !== app.buildId) return; // stale build
   if (msg.type === 'progress') {
+    const pct = msg.pct !== undefined ? ` ${Math.round(msg.pct * 100)}%` : '';
     const stageText = {
+      'depth-download': `Downloading depth model…${pct}`,
+      depth: 'Estimating depth (on-device AI)…',
       normalize: 'Normalizing depth…', refine: 'Refining depth edges…',
       heuristic: 'Estimating depth (heuristic)…', edges: 'Finding silhouettes…',
-      inpaint: 'Synthesizing hidden areas…', build: 'Building splats…', done: 'Almost there…',
+      inpaint: 'Synthesizing hidden areas…',
+      'fill-download': `Downloading fill model…${pct}`,
+      fill: msg.total ? `Generative fill… ${msg.done}/${msg.total}` : 'Generative fill…',
+      build: 'Building splats…', done: 'Almost there…',
     }[msg.stage] || 'Working…';
     status(stageText, true);
   } else if (msg.type === 'built') {
     onBuilt(msg);
+  } else if (msg.type === 'fill-failed') {
+    console.warn('fill failed:', msg.message);
+    status('AI fill unavailable — using fast fill', false, 4000);
+    stopWatchdog();
   } else if (msg.type === 'error') {
     console.error('pipeline error:', msg.message);
     status('Something went wrong building the splat', false, 5000);
+    stopWatchdog();
   }
-};
-pipelineWorker.onerror = (e) => {
-  console.error('pipeline worker failed:', e.message || e);
-  status('Pipeline worker failed — reload the page', false, 8000);
+}
+
+function spawnPipelineWorker() {
+  pipelineWorker = new Worker(new URL('./pipeline/pipeline-worker.js', import.meta.url), { type: 'module' });
+  pipelineWorker.onmessage = onPipelineMessage;
+  pipelineWorker.onerror = (e) => {
+    console.error('pipeline worker failed:', e.message || e);
+    // stop the watchdog or it would respawn-and-fail in a loop forever
+    stopWatchdog();
+    app.workerDead = true;
+    status('Pipeline worker failed — reload the page', false, 8000);
+    $('btnExport').disabled = false;
+  };
+  pipelineWorker.onmessageerror = (e) => console.error('pipeline messageerror:', e);
+}
+spawnPipelineWorker();
+
+// Watchdog: wasm model inference blocks the worker, so a wedged ORT call can
+// never time itself out. If a build goes quiet for too long, respawn the
+// worker without AI and rebuild — the app must never end up hung.
+let watchdogTimer = 0;
+let watchdogArmed = false;
+function feedWatchdog() {
+  if (!watchdogArmed) return;
+  clearTimeout(watchdogTimer);
+  watchdogTimer = setTimeout(onWatchdog, 150000);
+}
+function armWatchdog() {
+  watchdogArmed = true;
+  feedWatchdog();
+}
+function stopWatchdog() {
+  watchdogArmed = false;
+  clearTimeout(watchdogTimer);
+}
+function onWatchdog() {
+  if (!watchdogArmed) return;
+  stopWatchdog();
+  try { pipelineWorker.terminate(); } catch { /* already dead */ }
+  spawnPipelineWorker();
+  // the terminated worker takes any in-flight export with it
   $('btnExport').disabled = false;
-};
-pipelineWorker.onmessageerror = (e) => console.error('pipeline messageerror:', e);
+  // if this build's classical preview is already on screen, the hang was in
+  // the FILL stage: keep the standing cloud and camera, disable only the fill
+  const previewStands = app.meta && app.meta.phase === 'preview' && app.setupId === app.buildId;
+  if (previewStands) {
+    console.error('fill watchdog tripped — keeping the classical preview');
+    app.aiFillBroken = true;
+    status('AI fill hung — keeping fast fill', false, 4000);
+  } else {
+    console.error('pipeline watchdog tripped — respawning worker without AI');
+    app.aiBroken = true;
+    status('AI hung — rebuilding without it', false, 4000);
+    kickBuild();
+  }
+}
 
 sortWorker.onmessage = (e) => {
   const msg = e.data;
   if (msg.type !== 'sorted') return;
   app.sortBusy = false;
-  // gen must match AND the index count must match the current cloud —
+  // gen must match AND the index count must match the target cloud —
   // a sort of the previous cloud must never index the new one
-  if (msg.indices && msg.gen === app.sortGen &&
-      app.cloud && msg.indices.length === app.cloud.count) {
-    renderer.setSortedIndices(msg.indices);
-    app.spareIdx = msg.indices;
-    app.needsRender = true;
+  if (msg.indices && msg.gen === app.sortGen) {
+    const pend = app.pendingCloud;
+    if (pend && msg.indices.length === pend.cloud.count) {
+      // promote the parked AI-final: swapping only when its sort is ready
+      // means the first visible frame is fully sorted (no popping flicker)
+      app.cloud = pend.cloud;
+      app.meta = pend.meta;
+      app.pendingCloud = null;
+      try { renderer.setCloud(app.cloud); } catch (err) { console.error('setCloud failed:', err); }
+      renderer.setSortedIndices(msg.indices);
+      app.spareIdx = msg.indices;
+      app.needsRender = true;
+    } else if (!pend && app.cloud && msg.indices.length === app.cloud.count) {
+      renderer.setSortedIndices(msg.indices);
+      app.spareIdx = msg.indices;
+      app.needsRender = true;
+    }
   }
   maybeSort();
 };
@@ -181,21 +262,37 @@ function buildParams() {
     zRange: DEFAULTS.zRange * settings.depthStrength,
     sizeFactor: 0.65,
     edgeDispJump: DEFAULTS.edgeDispJump,
+    farKnee: DEFAULTS.farKnee,
+    farKeep: DEFAULTS.farKeep,
     bgBandPx: DEFAULTS.bgBandPx,
     skirtPx: DEFAULTS.skirtPx,
     underStep: DEFAULTS.underlayerStep,
     withBg: settings.withBg,
     withSkirt: settings.withSkirt,
     withUnder: settings.withUnder,
-    refine: app.disparityKind === 'ai',
+    wantAiDepth: settings.aiDepth && !app.aiBroken,
+    aiFill: settings.aiFill && !app.aiBroken && !app.aiFillBroken,
+    deviceClass: isMobile() ? 'mobile' : 'desktop',
+    forceWasmFill: urlParams.get('fillep') === 'wasm',
+    // Chrome on iPadOS wears the desktop-Mac UA — only maxTouchPoints here on
+    // the main thread can unmask it; the worker must never run the JSEP/webgpu
+    // ORT builds on a WebKit engine (ORT #26827/#26480)
+    webkitHint: isSafariEngine() ||
+      (navigator.userAgent.includes('Macintosh') && navigator.maxTouchPoints > 2),
     quality: q,
   };
 }
 
 function kickBuild() {
   if (!app.imageData) return;
+  if (app.workerDead) {
+    status('Pipeline worker failed — reload the page', false, 8000);
+    return;
+  }
   app.buildId++;
+  app.pendingCloud = null; // a newer build supersedes any parked final swap
   status('Building splats…', true);
+  armWatchdog();
   const rgbaCopy = app.imageData.data.slice();
   const dispCopy = app.disparity ? app.disparity.slice() : null;
   const transfer = [rgbaCopy.buffer];
@@ -209,32 +306,73 @@ function kickBuild() {
   }, transfer);
 }
 
+function modelInfoText(meta) {
+  const depth = meta.depthKind === 'ai'
+    ? `depth: DA V2 ${meta.depthTier} · ${meta.depthBackend}`
+    : meta.depthKind === 'gt' ? 'depth: bundled ground truth'
+      : 'depth: heuristic (AI model unavailable)';
+  const fill = meta.fillKind === 'ai'
+    ? ` · fill: MI-GAN · ${meta.fillBackend}`
+    : meta.fillKind === 'classical' ? ' · fill: classical' : '';
+  return depth + fill;
+}
+
 function onBuilt(msg) {
   // buffers arrive TRANSFERRED from the worker — use them directly
-  // (new Float32Array(...) here would deep-copy ~110 MB at 'high')
-  app.cloud = {
+  // (a deep copy here would cost ~110 MB at 'high')
+  const cloud = {
     count: msg.count,
     positions: msg.positions,
     cov: msg.cov,
     colors: msg.colors,
   };
+  app.disparityKind = msg.meta.depthKind === 'heuristic' ? 'none' : msg.meta.depthKind;
+  $('modelInfo').textContent = modelInfoText(msg.meta);
+
+  // a 'final' rebuild for a build we already set up (AI fill arriving after
+  // the preview): keep showing the sorted preview and PARK the final until
+  // its own sort lands — no unsorted popping frames, no camera/focus yank
+  const revisit = msg.meta.phase === 'final' && app.setupId === msg.id && app.cloud;
+  if (revisit) {
+    app.pendingCloud = { cloud, meta: msg.meta };
+    app.sortGen++; // in-flight sorts of the preview must not promote/apply
+    app.spareIdx = null;
+    const posCopy = cloud.positions.slice();
+    sortWorker.postMessage(
+      { type: 'points', positions: posCopy, count: cloud.count }, [posCopy.buffer]);
+    app.lastSortView = null;
+    requestSort();
+    stopWatchdog();
+    status(`✨ AI fill applied · ${(msg.count / 1e6).toFixed(2)}M splats`, false, 3200);
+    return;
+  }
+
+  app.cloud = cloud;
   app.meta = msg.meta;
+  app.pendingCloud = null;
   // invalidate any in-flight sort of the previous cloud NOW — its reply must
   // not index into the new textures
   app.sortGen++;
   app.spareIdx = null;
-  renderer.setCloud(app.cloud);
+  try { renderer.setCloud(app.cloud); } catch (err) { console.error('setCloud failed:', err); }
   const posCopy = app.cloud.positions.slice();
   sortWorker.postMessage(
     { type: 'points', positions: posCopy, count: app.cloud.count },
     [posCopy.buffer]);
+
   controls.setHome(-msg.meta.centerZ, msg.meta.centerZ);
   app.targetFocus = app.focusDist = msg.meta.centerZ;
   syncFocusSlider();
+  app.setupId = msg.id;
   app.lastSortView = null;
   app.needsRender = true;
   requestSort();
-  status(`${(msg.count / 1e6).toFixed(2)}M splats`, false, 3200);
+  if (msg.meta.phase === 'preview') {
+    status('Enhancing hidden areas with AI…', true);
+  } else {
+    stopWatchdog();
+    status(`${(msg.count / 1e6).toFixed(2)}M splats`, false, 3200);
+  }
   $('welcome').hidden = true;
   showHint();
 }
@@ -249,26 +387,9 @@ function showHint() {
   setTimeout(() => { el.hidden = true; }, 7800);
 }
 
-let estimatorPromise = null; // memoized: concurrent calls must not double-load
-async function ensureEstimator() {
-  if (urlParams.has('nomodel')) return null;
-  if (!estimatorPromise) {
-    status('Loading depth model (first time: ~25 MB)…', true);
-    estimatorPromise = DepthEstimator.load(({ phase, pct }) => {
-      if (phase === 'download') {
-        status(`Downloading depth model… ${Math.round(pct * 100)}%`, true);
-      }
-    });
-  }
-  app.estimator = await estimatorPromise;
-  if (app.estimator) {
-    $('modelInfo').textContent = `depth: Depth Anything V2 · ${app.estimator.backend}`;
-  }
-  return app.estimator;
-}
-
 // Every open flow takes a token; after each await, a newer token means the
 // user opened something else — abandon, never mix state from two images.
+// Depth estimation happens in the pipeline worker (part of the build).
 let loadToken = 0;
 
 async function openBlob(blob) {
@@ -277,23 +398,10 @@ async function openBlob(blob) {
     status('Reading photo…', true);
     const { imageData } = await loadImageBlob(blob, maxPixels());
     if (token !== loadToken) return;
-    const est = await ensureEstimator();
-    if (token !== loadToken) return;
-    let disparity = null, kind = 'none';
-    if (est) {
-      status('Estimating depth (on-device AI)…', true);
-      await new Promise((r) => setTimeout(r, 30)); // let the status paint
-      disparity = await est.estimate(imageData, imageData.width, imageData.height);
-      kind = 'ai';
-      if (token !== loadToken) return;
-    } else {
-      $('modelInfo').textContent = 'depth: heuristic (AI model unavailable)';
-      status('AI model unavailable — using heuristic depth', true, 0);
-    }
     app.source = { sample: false, blob };
     app.imageData = imageData;
-    app.disparity = disparity;
-    app.disparityKind = kind;
+    app.disparity = null; // worker estimates (AI or heuristic fallback)
+    app.disparityKind = 'none';
     app.sourceId++;
     kickBuild();
   } catch (err) {
@@ -313,7 +421,6 @@ async function openSample() {
     app.disparity = disparity;
     app.disparityKind = 'gt';
     app.sourceId++;
-    $('modelInfo').textContent = 'depth: bundled ground truth';
     kickBuild();
   } catch (err) {
     console.error(err);
@@ -528,12 +635,13 @@ $('selQuality').addEventListener('change', (e) => {
   settings.quality = e.target.value;
   reopenCurrent();
 });
-for (const [id, key] of [['tBg', 'withBg'], ['tSkirt', 'withSkirt'], ['tUnder', 'withUnder']]) {
+for (const [id, key] of [['tBg', 'withBg'], ['tSkirt', 'withSkirt'], ['tUnder', 'withUnder'], ['tAiFill', 'aiFill']]) {
   $(id).addEventListener('change', (e) => {
     settings[key] = e.target.checked;
     kickBuild();
   });
 }
+$('tAiFill').checked = settings.aiFill;
 $('tWiggle').checked = settings.wiggle;
 $('tWiggle').addEventListener('change', (e) => {
   settings.wiggle = e.target.checked;

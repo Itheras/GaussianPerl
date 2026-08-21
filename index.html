@@ -62,6 +62,7 @@
       </div>
       <div class="row toggles">
         <label><input type="checkbox" id="tBg" checked> Edge fill</label>
+        <label><input type="checkbox" id="tAiFill" checked> AI fill</label>
         <label><input type="checkbox" id="tSkirt" checked> Skirt</label>
         <label><input type="checkbox" id="tUnder" checked> Underlayer</label>
         <label><input type="checkbox" id="tWiggle" checked> Wiggle</label>
@@ -75,14 +76,14 @@
     <div id="welcome">
       <h1>🫧 GaussianPerl</h1>
       <p>Turn one photo into a 3D gaussian splat — right on this device.</p>
-      <p class="dim">A local AI model estimates depth, hidden areas are synthesized,
-        and you get a splat you can orbit, refocus and capture.</p>
+      <p class="dim">Local AI models estimate depth and dream up the areas the
+        camera never saw — you get a splat you can orbit, refocus and capture.</p>
       <div class="welcomeButtons">
         <button id="btnWelcomeOpen" class="primary">📷 Open a photo</button>
         <button id="btnWelcomeSample">✨ Try the sample</button>
       </div>
-      <p class="dim small">Photos never leave your device. The depth model (~25&nbsp;MB)
-        downloads once and is cached.</p>
+      <p class="dim small">Photos never leave your device. The depth (25–75&nbsp;MB,
+        depending on your device) and fill (~28&nbsp;MB) models download once and are cached.</p>
     </div>
   </div>
 

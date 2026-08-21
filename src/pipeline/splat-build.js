@@ -18,12 +18,15 @@ function addCov(cov, o, ax, ay, az, s2) {
 }
 
 /**
- * args: {rgba, w, h, disp, edges, bg, params}
+ * args: {rgba, w, h, disp, edges, bg, plate, params}
  * params: {fovYDeg, zNear, zRange, sizeFactor, skirtPx, underStep,
- *          withSkirt, withUnder, withBg, edgeDispJump}
+ *          withSkirt, withUnder, withBg, edgeDispJump, bgShade}
+ * plate (optional): {rgba, disp, padPx, pw, ph} — AI-outpainted border plate;
+ *   when present the skirt reads real synthesized content from it instead of
+ *   mirroring the photo.
  * returns {count, positions, cov, colors, meta}
  */
-export function buildSplats({ rgba, w, h, disp, edges, bg, params }) {
+export function buildSplats({ rgba, w, h, disp, edges, bg, plate, params }) {
   const fovY = (params.fovYDeg ?? 55) * Math.PI / 180;
   const f = (h / 2) / Math.tan(fovY / 2);
   const cx = w / 2, cy = h / 2;
@@ -171,7 +174,9 @@ export function buildSplats({ rgba, w, h, disp, edges, bg, params }) {
       if (okB) return bgDepth[i] - bgDepth[iB];
       return 0;
     };
-    const shade = 0.94; // disoccluded areas read naturally as soft shadow
+    // classical fill is darkened to read as soft shadow (hides its smear);
+    // AI fill matches surroundings and ships unshaded (bgShade = 1)
+    const shade = params.bgShade ?? 0.94;
     for (let y = 0; y < h; y++) {
       const ym = Math.max(y - 1, 0), yp = Math.min(y + 1, h - 1);
       for (let x = 0; x < w; x++) {
@@ -208,8 +213,32 @@ export function buildSplats({ rgba, w, h, disp, edges, bg, params }) {
   }
   const underCount = n - fineCount - bgCount;
 
-  // ---------- border skirt (mirrored fading outpaint) ----------
-  if (skirtPx > 0) {
+  // ---------- border skirt ----------
+  if (skirtPx > 0 && plate && plate.padPx >= skirtPx) {
+    // AI-outpainted plate: real synthesized content beyond the borders —
+    // full brightness, gentle fade only near the outer rim
+    const { rgba: pRgba, disp: pDisp, padPx, pw } = plate;
+    const zf2 = params.zNear + params.zRange;
+    const dA = 1 / params.zNear - 1 / zf2, dB = 1 / zf2;
+    for (let y = -skirtPx; y < h + skirtPx; y += 2) {
+      for (let x = -skirtPx; x < w + skirtPx; x += 2) {
+        if (x >= 0 && x < w && y >= 0 && y < h) continue;
+        const pi = (y + padPx) * pw + (x + padPx);
+        if (pRgba[pi * 4 + 3] < 8) continue;
+        const distOut = Math.max(x < 0 ? -x : x - w + 1, y < 0 ? -y : y - h + 1, 0);
+        const fade = Math.pow(1 - Math.min(distOut / skirtPx, 1), 1.2);
+        const alpha = Math.round(240 * fade);
+        if (alpha < 10) continue;
+        const z = 1 / (pDisp[pi] * dA + dB);
+        const [px, py, pz] = unproject(x + 0.5, y + 0.5, z);
+        const sigma = sizeFactor * z / f * 2.0;
+        facingCov(px, py, pz, sigma, c6);
+        emit(px, py, pz, c6,
+          pRgba[pi * 4], pRgba[pi * 4 + 1], pRgba[pi * 4 + 2], alpha);
+      }
+    }
+  } else if (skirtPx > 0) {
+    // fallback: mirrored fading outpaint from the photo itself
     const mirror = (v, size) => {
       let m = v;
       if (m < 0) m = -m - 1;
@@ -246,11 +275,8 @@ export function buildSplats({ rgba, w, h, disp, edges, bg, params }) {
     focalPx: f, width: w, height: h,
   };
 
-  return {
-    count: n,
-    positions: positions.slice(0, n * 3),
-    cov: cov.slice(0, n * 6),
-    colors: colors.slice(0, n * 4),
-    meta,
-  };
+  // return the cap-sized buffers unsliced — every consumer (renderer textures,
+  // sort worker, .splat export) honors `count`, and slicing here would double
+  // the peak allocation (~64 MB at 'high') for nothing
+  return { count: n, positions, cov, colors, meta };
 }

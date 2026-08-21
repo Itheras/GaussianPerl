@@ -129,7 +129,8 @@ function smoothWithinMask(bgColor, bgDisp, bgMask, w, h, jump) {
 }
 
 // subtle deterministic grain so the fill doesn't read as an airbrushed smear
-function addGrain(bgColor, bgMask, w, h) {
+// (also applied over AI fills to hide the model's 512-crop softness)
+export function addGrain(bgColor, bgMask, w, h) {
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = y * w + x;

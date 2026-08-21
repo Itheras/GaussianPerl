@@ -60,6 +60,94 @@ field with tap-to-focus), then **save a normal PNG** of the view you like.
 
 ## Milestone log
 
+### M7 — Generative fill: "the missing data must look real" (DONE)
+Goal: revealed/outpainted areas indistinguishable from the photo. Research
+(6-agent web workflow, findings verified with curl/graph inspection) → design →
+implement → 35-agent adversarial review (27 confirmed findings applied/triaged).
+- **Fill model: MI-GAN-512-Places2 full pipeline ONNX** (28.1 MB,
+  `andraniksargsyan/migan/migan_pipeline_v2.onnx`, revision-pinned, sha256-gated,
+  jsdelivr `migan-onnx@1.0.0` as hash-gated mirror; GitHub release assets send
+  NO CORS header — not a mirror option). I/O: uint8 `image` [1,3,H,W] dynamic,
+  uint8 `mask` [1,1,H,W] **255=known, 0=hole**, output `result` uint8; crop
+  around mask bbox +128px → 512 → feathered ScatterND blend ALL in-graph, known
+  pixels bit-exact. Runs under **onnxruntime-web 1.27.0** INSIDE the pipeline
+  worker. Verified live: webgpu EP works on Chrome (fast), wasm elsewhere.
+- **ORT bundle choice is a SAFETY matter**: WebKit gets `ort.wasm.bundle.min.mjs`
+  (plain build) ONLY — jsep/asyncify builds melt WebKit 26.2's JIT (ORT #26827,
+  unfixed); webgpu EP broken on iPhone (#26480). Non-Safari+adapter probe OK →
+  `ort.webgpu.bundle.min.mjs` with run-time fallback to a fresh wasm session.
+  isSafariEngine(): iOS-family check FIRST (CriOS/EdgiOS are WebKit!); Chrome on
+  iPadOS wears the desktop-Mac UA → main thread forwards `webkitHint`
+  (Macintosh + maxTouchPoints>2) into the worker.
+- **Depth moved into the pipeline worker + transformers.js v4.2.0** (v3 ships
+  only the JSEP wasm → exposed on iOS 26.2; v4 pins Safari to the plain build
+  but no longer proxies wasm off-thread → main-thread inference would jank).
+  Tiering: DA V2 **base q4f16** on desktop webgpu, small fp16 webgpu, small q8
+  wasm. MUST probe `navigator.gpu.requestAdapter()` before ANY webgpu attempt:
+  gpu-object-exists-but-no-adapter environments fail AND a failed webgpu
+  attempt can poison the in-context wasm fallback (found via e2e, probe-fixed).
+  `device:'wasm'` alone works fine in v4 when attempted first.
+- **Fill algorithm**: classical `synthesizeBackground` keeps supplying GEOMETRY
+  (bgDisp/bgMask — Kopf 2020: heuristic depth diffusion is adequate); the model
+  replaces COLOR. Hole mask = bgMask ∪ fg **collar** (surface-following BFS
+  from fgBoundary, ~2% short side — the occluder must be INSIDE the mask or
+  the GAN continues it into the hole) ∪ 2px mixed-pixel rim. Per-cluster calls
+  (32px-grid CC → merge <48px → split >512px w/ 96 overlap → coarsen ×1.6 until
+  ≤6 calls desktop / 4 mobile; clusters with <24 *consumable* px keep classical)
+  chained sequentially so later calls see earlier fills as context. Border
+  outpaint: mirror-padded plate, ring mask, ≤6 tile calls at 768px, chained
+  after interior. Prefill holes with classical colors so cross-tile context
+  looks like background.
+- **The two realism fixes that mattered (found by layer-isolation in browser)**:
+  1. **Low-frequency anchoring**: GAN fills hallucinate at scale (dark blobs in
+     grass, invented structures behind the horizon band). Fix: masked-box-blur
+     correction `ai += blur((ref−ai)·mask)/blur(mask)` (r≈1.5% short side) —
+     large-scale color pinned to the classical estimate, AI texture survives.
+     Same treatment for the ring vs the exact plate init the model saw.
+  2. **Far-field disparity compression** (`compressFarField`, knee 0.16 keep
+     0.25, BEFORE snap/edge detection): real far fields don't parallax; the
+     normalized-disparity range exaggerated sky/mountain separation into a
+     "slab curtain" + made the horizon a giant hallucination-prone
+     disocclusion edge. Compression turns it into one coherent backdrop and
+     deletes those fills wholesale. (Sample GT: sky .02, ridges .055-.16,
+     ground-foot .30 — banded worst case.)
+- **Progressive build**: classical preview 'built' ships at classical speed →
+  fill (download progress, per-call n/m) → 'final' built. Final is PARKED
+  (`app.pendingCloud`) until its own sort lands — first visible frame fully
+  sorted, no popping, no camera/focus yank (`setupId` guard). Superseded builds
+  abort between model calls (macrotask checkpoint + AbortError — microtask-only
+  chains starve onmessage) but a COMPLETED fill is cached even when superseded.
+  Stage-cache: disp/edges/bg/fill keyed by sourceId; fill cache-hit requires
+  plate.padPx ≥ current skirtPx AND bgColor when bg wanted; `fillFailed` flag
+  stops per-rebuild churn (retry on next source).
+- **Robustness net** (review findings): est.estimate() try/catch → heuristic
+  (OOM on phones must not kill the build); model-session mutexes (worker
+  re-entry during await); main-side 150s watchdog fed by ANY worker message
+  (stale-id progress included!) → if preview stands, only `aiFillBroken` (cloud
+  kept), else full respawn + `aiBroken`; worker onerror stops the watchdog
+  (no respawn loop) + `workerDead`; export button re-enabled on respawn;
+  renderer.setCloud no-ops on lost context; alpha preserved through the model
+  round-trip (transparent-source guard stays alive); no-Content-Length
+  downloads still post progress; crypto.subtle absent (http-over-LAN dev) →
+  author-URL-only unverified, mirror disabled; skipped-cluster bg pixels keep
+  classical shade ×0.94 + single grain; discarded collar output excluded from
+  the plate init/context/anchor; buildSplats returns cap-sized buffers +
+  count (no slice copies, all consumers honor count).
+- **UI**: 'AI fill' toggle; status flow 'Enhancing hidden areas with AI…' →
+  '✨ AI fill applied · N splats'; modelInfo 'depth: DA V2 small · wasm · fill:
+  MI-GAN · webgpu'; URL params: `nomodel` (no AI at all), `nofill`,
+  `fillep=wasm` (e2e/SwiftShader). bg shade 1.0 for AI fills (0.94 classical),
+  plate skirt fade exp 1.2 α≤240, ring disparity smoothed (blur + ramp) —
+  raw replicate depth made the horizon cliff a staircase of slabs in the ring.
+- **Deferred (recorded, with review's blessing-by-triage)**: [8] nested model
+  worker + terminate for iOS memory reclaim (wasm heaps never shrink; both
+  runtimes+stage cache resident ≈ low-hundreds MB — revisit if jetsam shows
+  up); [9] per-call crop packing (pack is 1-2% of a call vs inference — not
+  worth contract risk); [15] webgpu-poisoning respawn protocol for depth
+  (adapter probe covers the common case); [21B] preview/final segment reuse;
+  [23B] sub-rect blurs. LaMa fp16 webgpu HQ tier (g-ronimo export, 106MB,
+  0.25s/call) documented as a possible desktop upgrade.
+
 ### M6 — Adversarial review + fixes (DONE)
 - Ran a 28-agent multi-lens review (6 finders: safari-ios / gl-correctness /
   math-pipeline / workers-async / touch-ux / memory-perf → dedupe → 1
@@ -162,6 +250,23 @@ field with tap-to-focus), then **save a normal PNG** of the view you like.
 
 ## Known platform gotchas (learned/anticipated)
 
+- **ORT-web on WebKit: plain wasm bundle ONLY** (`ort.wasm.bundle.min.mjs`).
+  The jsep/asyncify builds melt WebKit 26.2's JIT (ORT #26827); webgpu EP
+  fails on iPhones (#26480). Every iOS browser is WebKit (CriOS/EdgiOS too);
+  Chrome-on-iPadOS wears the desktop-Mac UA → needs main-thread webkitHint.
+- **Probe `navigator.gpu.requestAdapter()` before ANY webgpu attempt** (ORT or
+  transformers.js): gpu object can exist with no adapter (headless, blocklists),
+  and a failed webgpu attempt can poison the same-context wasm fallback.
+- transformers.js v4: no wasm proxying (inference blocks the calling thread —
+  run it in a worker); v3 ships ONLY the JSEP wasm binary (iOS 26.2 hazard).
+- Wasm model calls block the worker thread: nothing async can preempt them.
+  Yield a MACROTASK between calls or queued onmessage (rebuilds!) starves;
+  main-side watchdog must treat ANY worker message as liveness (stale ids too).
+- HF `/resolve/` URLs + jsdelivr: CORS `*` verified. GitHub release assets:
+  NO ACAO header — never a browser model mirror.
+- CacheStorage works in workers; crypto.subtle needs a secure context (absent
+  on http-over-LAN iPhone dev — hash-gating policy degrades to author-URL-only).
+
 - iOS Safari memory: cap base-layer splats ≈ 0.7 M on phones (UA + deviceMemory
   heuristic), ≈ 1.4 M desktop. RGBA32F textures: ~48 B/splat GPU side.
 - `EXT_color_buffer_float` needed for HDR+depth MRT; fall back to
@@ -189,11 +294,19 @@ field with tap-to-focus), then **save a normal PNG** of the view you like.
 
 ## Open questions / next steps
 
-- Mountains/horizon band on the sample still reads as terraced cardboard at
-  extreme yaw (>0.4) — inherent to giant far-depth cliffs; acceptable within
-  soft limits. Could compress far-field disparity nonlinearly if it bothers.
-- Fill brightness can mismatch surroundings slightly (haze-lightened pulls);
-  shading ×0.94 hides most of it.
-- transformers.js AI path is untested in the headless env (no model download
-  in CI) — verify on a real device when possible; the wasm-q8 fallback chain
-  is the risk area.
+- **Verify on real devices**: iPhone Safari (wasm fill timing 2-5s/call ×
+  2-4 calls, memory headroom, webkitHint path) and desktop Safari 26. The
+  e2e-ai suite covers real model downloads + wasm inference in Chromium only.
+- iOS memory reclaim (deferred review finding [8]): both AI runtimes stay
+  resident in the pipeline worker. If iPhone jetsam appears, move models into
+  a terminable child worker (Safari ≥15.5 supports nested workers).
+- Optional HQ fill tier for desktop webgpu: g-ronimo/lama `lama_512_fp16.onnx`
+  (106.6 MB, Apache-2.0, matmul-FFT rewrite, ~0.25 s/call webgpu; NEVER wasm —
+  52-61 s). Manual crop/512/composite adapter needed (fixed input, float32
+  [1,4,512,512], mask channel 1=hole — polarity OPPOSITE to MI-GAN).
+- Far-field knee (0.16/0.25) tuned on the synthetic sample; sanity-check on
+  real photos (indoor scenes: a far wall at normalized disp <0.16 loses a bit
+  of true parallax — acceptable trade so far).
+- The e2e stale-JS-eval quirk in the in-app browser pane (javascript_exec can
+  hit a pre-navigation context right after navigate) — screenshots are ground
+  truth; re-eval after the page settles.

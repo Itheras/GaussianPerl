@@ -54,6 +54,26 @@ export function refineDisparity(disp, rgba, w, h) {
 }
 
 /**
+ * Compress the far tail of the disparity range: in real life the far field
+ * (mountains vs sky) shows ~zero relative parallax for a head-sized camera
+ * move, but a normalized-disparity range mapped onto a finite depth span
+ * exaggerates it into floating "cardboard" slabs — and makes the horizon line
+ * read as a giant disocclusion edge (hallucination-prone fill band, slab
+ * curtain under yaw). Monotone map: [0, knee] -> [knee*(1-keep), knee],
+ * everything >= knee unchanged. Run BEFORE snap/edge detection so a
+ * compressed horizon stops being a silhouette; true near-vs-sky silhouettes
+ * still jump far beyond the edge threshold.
+ */
+export function compressFarField(disp, knee = 0.08, keep = 0.35) {
+  const out = new Float32Array(disp.length);
+  for (let i = 0; i < disp.length; i++) {
+    const d = disp[i];
+    out[i] = d < knee ? knee - (knee - d) * keep : d;
+  }
+  return out;
+}
+
+/**
  * Map disparity [0,1] to positive view depth. Physically disparity ~ 1/z:
  * 1/z = d*(1/zn - 1/zf) + 1/zf, with zf = zn + range.
  */

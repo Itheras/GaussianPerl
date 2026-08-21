@@ -1,7 +1,8 @@
-// Optional e2e for the REAL AI depth path: downloads Depth Anything V2 small
-// through transformers.js (network required; ~25 MB on first run) and runs
-// wasm inference in headless Chromium. Slow — not part of the default suite.
-// Run: node e2e/run-e2e-ai.mjs
+// Optional e2e for the REAL AI paths: downloads Depth Anything V2 (transformers
+// .js) AND the MI-GAN fill model (onnxruntime-web) through their CDNs (network
+// required; ~25 MB + ~28 MB on first run), runs wasm inference in headless
+// Chromium, and verifies the generative-fill preview->final build flow.
+// Slow — not part of the default suite. Run: node e2e/run-e2e-ai.mjs
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -44,52 +45,62 @@ const browser = await chromium.launch({ headless: true, args: ['--enable-unsafe-
 const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
 page.on('console', (m) => {
   const t = m.text();
-  if (m.type() === 'error' || /model|depth|wasm|onnx/i.test(t)) console.log('  [page]', t.slice(0, 200));
+  if (m.type() === 'error' || /model|depth|fill|wasm|onnx/i.test(t)) console.log('  [page]', t.slice(0, 200));
 });
 
 try {
-  await page.goto(`${base}/?nowiggle=1&quality=low&maxpx=120000`);
+  // fillep=wasm: never attempt the WebGPU EP under SwiftShader
+  await page.goto(`${base}/?nowiggle=1&quality=low&maxpx=120000&fillep=wasm`);
   await page.waitForFunction(() => window.__gp, null, { timeout: 30000 });
 
-  console.log('  loading photo through the AI path (model download + wasm inference)…');
+  console.log('  loading photo through the AI path (model downloads + wasm inference)…');
   await page.evaluate(async () => {
     const blob = await (await fetch('/assets/sample.png')).blob();
     window.__gp.openBlob(blob); // no await: resolves after full build
   });
-  await page.waitForFunction(
-    () => window.__gp.app.disparityKind !== undefined &&
-      window.__gp.app.cloud && window.__gp.app.disparityKind !== 'gt',
+
+  // preview (or single final) build lands first
+  await page.waitForFunction(() => window.__gp.app.cloud && window.__gp.app.meta,
     null, { timeout: 600000 });
+  const meta1 = await page.evaluate(() => window.__gp.app.meta);
+  check(meta1.depthKind === 'ai', `depth came from the AI model (kind=${meta1.depthKind})`,
+    meta1.depthKind === 'heuristic' ? '(model unreachable — heuristic fallback took over; network?)' : '');
+  console.log(`  depth backend: ${meta1.depthBackend} (${meta1.depthTier}); first phase: ${meta1.phase}`);
 
-  const kind = await page.evaluate(() => window.__gp.app.disparityKind);
-  check(kind === 'ai', `depth came from the AI model (kind=${kind})`,
-    kind === 'none' ? '(model unreachable — heuristic fallback took over; network?)' : '');
-
-  if (kind === 'ai') {
-    const backend = await page.evaluate(() => window.__gp.app.estimator && window.__gp.app.estimator.backend);
-    console.log(`  backend: ${backend}`);
-    // disparity sanity: near (bottom) should be closer than sky (top)
-    const sane = await page.evaluate(() => {
-      const { imageData, disparity } = window.__gp.app;
-      const w = imageData.width, h = imageData.height;
-      const avg = (y0, y1) => {
-        let s = 0, n = 0;
-        for (let y = y0; y < y1; y++) for (let x = 0; x < w; x += 3) { s += disparity[y * w + x]; n++; }
-        return s / n;
-      };
-      return { top: avg(0, Math.floor(h * 0.15)), bottom: avg(Math.floor(h * 0.85), h) };
-    });
-    check(sane.bottom > sane.top, `AI disparity: bottom nearer than sky (top ${sane.top.toFixed(2)}, bottom ${sane.bottom.toFixed(2)})`);
-
-    const stats = await page.evaluate(() => {
-      const cap = window.__gp.captureNow(1);
-      let sum = 0;
-      const n = cap.width * cap.height;
-      for (let i = 0; i < n; i++) sum += (cap.pixels[i * 4] + cap.pixels[i * 4 + 1] + cap.pixels[i * 4 + 2]) / 3;
-      return sum / n;
-    });
-    check(stats > 15, `AI-depth splat renders (mean luma ${stats.toFixed(1)})`);
+  if (meta1.depthKind === 'ai') {
+    check(meta1.dispBottomMean > meta1.dispTopMean,
+      `AI disparity: bottom nearer than sky (top ${meta1.dispTopMean.toFixed(2)}, bottom ${meta1.dispBottomMean.toFixed(2)})`);
   }
+
+  // generative fill: wait for the final phase with AI fill applied
+  console.log('  waiting for the generative fill (MI-GAN download + wasm calls)…');
+  await page.waitForFunction(
+    () => window.__gp.app.meta && window.__gp.app.meta.phase === 'final',
+    null, { timeout: 600000 });
+  const meta2 = await page.evaluate(() => window.__gp.app.meta);
+  check(meta2.fillKind === 'ai', `generative fill applied (fillKind=${meta2.fillKind})`);
+  check(meta2.fillBackend === 'wasm', `fill backend honored fillep=wasm (${meta2.fillBackend})`);
+  check(meta2.bgCount > 0, `disocclusion layer present (${meta2.bgCount} splats)`);
+  check(meta2.skirtCount > 0, `outpainted skirt present (${meta2.skirtCount} splats)`);
+
+  const stats = await page.evaluate(() => {
+    const cap = window.__gp.captureNow(1);
+    let sum = 0;
+    const n = cap.width * cap.height;
+    for (let i = 0; i < n; i++) sum += (cap.pixels[i * 4] + cap.pixels[i * 4 + 1] + cap.pixels[i * 4 + 2]) / 3;
+    return sum / n;
+  });
+  check(stats > 15, `AI-filled splat renders (mean luma ${stats.toFixed(1)})`);
+
+  fs.mkdirSync(path.join(root, 'e2e/out'), { recursive: true });
+  const shot = await page.evaluate(() => {
+    const cap = window.__gp.captureNow(1);
+    return { w: cap.width, h: cap.height, px: Array.from(cap.pixels) };
+  });
+  const { encodePNG } = await import('../tools/png.mjs');
+  fs.writeFileSync(path.join(root, 'e2e/out/render-ai-fill.png'),
+    encodePNG(shot.w, shot.h, Uint8ClampedArray.from(shot.px)));
+  console.log('  (screenshot: e2e/out/render-ai-fill.png)');
 } finally {
   await browser.close();
   server.close();

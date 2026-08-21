@@ -122,6 +122,9 @@ export class SplatRenderer {
   /** cloud: {count, positions f32x3, cov f32x6, colors u8x4} */
   setCloud(cloud) {
     const gl = this.gl;
+    // a 'built' can land while the context is lost (widened by the two-phase
+    // build) — no-op is correct: onContextRestored re-uploads app.cloud
+    if (this.contextLost || gl.isContextLost()) return;
     for (const t of [this.texPos, this.texCovA, this.texCovB, this.texColor]) {
       if (t) gl.deleteTexture(t);
     }
