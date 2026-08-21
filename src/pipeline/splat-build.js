@@ -1,0 +1,235 @@
+// Build gaussian splats from an image + disparity:
+//   - fine layer: one anisotropic, normal-oriented gaussian per pixel
+//   - background layer: synthesized disocclusion fill behind silhouettes
+//   - underlayer: coarse crack-filling splats
+//   - skirt: mirrored fading rim beyond the image borders
+// Covariance is Σ = Σᵢ sᵢ² aᵢaᵢᵀ from an orthonormal frame — no quaternions.
+
+import { disparityToDepth } from './depthproc.js';
+import { percentile } from '../util/imageops.js';
+
+function addCov(cov, o, ax, ay, az, s2) {
+  cov[o] += s2 * ax * ax;
+  cov[o + 1] += s2 * ax * ay;
+  cov[o + 2] += s2 * ax * az;
+  cov[o + 3] += s2 * ay * ay;
+  cov[o + 4] += s2 * ay * az;
+  cov[o + 5] += s2 * az * az;
+}
+
+/**
+ * args: {rgba, w, h, disp, edges, bg, params}
+ * params: {fovYDeg, zNear, zRange, sizeFactor, skirtPx, underStep,
+ *          withSkirt, withUnder, withBg, edgeDispJump}
+ * returns {count, positions, cov, colors, meta}
+ */
+export function buildSplats({ rgba, w, h, disp, edges, bg, params }) {
+  const fovY = (params.fovYDeg ?? 55) * Math.PI / 180;
+  const f = (h / 2) / Math.tan(fovY / 2);
+  const cx = w / 2, cy = h / 2;
+  const sizeFactor = params.sizeFactor ?? 0.65;
+  const jump = params.edgeDispJump ?? 0.05;
+
+  const depth = disparityToDepth(disp, params.zNear, params.zRange);
+
+  // capacity: fine + bg + underlayer + skirt (generous, trimmed at the end)
+  const underStep = params.underStep ?? 4;
+  const skirtPx = params.withSkirt ? (params.skirtPx ?? 24) : 0;
+  const skirtCap = skirtPx > 0
+    ? Math.ceil(((w + 2 * skirtPx) * (h + 2 * skirtPx) - w * h) / 4) + 16 : 0;
+  const cap = w * h
+    + (params.withBg && bg ? w * h : 0)
+    + (params.withUnder ? (Math.ceil(w / underStep) + 1) * (Math.ceil(h / underStep) + 1) : 0)
+    + skirtCap;
+
+  const positions = new Float32Array(cap * 3);
+  const cov = new Float32Array(cap * 6);
+  const colors = new Uint8Array(cap * 4);
+  let n = 0;
+
+  const unproject = (u, v, z) => [(u - cx) * z / f, -(v - cy) * z / f, -z];
+
+  // one-sided-safe depth derivative (avoid crossing discontinuities)
+  const dz = (iC, iA, iB, dC, dA, dB, zC, zA, zB) => {
+    const okA = Math.abs(dA - dC) < jump;
+    const okB = Math.abs(dB - dC) < jump;
+    if (okA && okB) return (zA - zB) * 0.5;
+    if (okA) return zA - zC;
+    if (okB) return zC - zB;
+    return 0;
+  };
+
+  const emit = (x, y, z, c6, r, g, b, a) => {
+    positions[n * 3] = x; positions[n * 3 + 1] = y; positions[n * 3 + 2] = z;
+    cov.set(c6, n * 6);
+    colors[n * 4] = r; colors[n * 4 + 1] = g; colors[n * 4 + 2] = b; colors[n * 4 + 3] = a;
+    n++;
+  };
+
+  const c6 = new Float32Array(6);
+
+  // camera-facing disc at position p with radius sigma
+  const facingCov = (px, py, pz, sigma, out) => {
+    out.fill(0);
+    const pl = Math.hypot(px, py, pz) || 1;
+    const vx = -px / pl, vy = -py / pl, vz = -pz / pl; // toward camera
+    // t1 = normalize(cross(v, up)), degenerate-safe
+    let t1x = vz, t1y = 0, t1z = -vx;
+    const t1l = Math.hypot(t1x, t1y, t1z);
+    if (t1l < 1e-5) { t1x = 1; t1y = 0; t1z = 0; }
+    else { t1x /= t1l; t1z /= t1l; }
+    const t2x = vy * t1z - vz * t1y;
+    const t2y = vz * t1x - vx * t1z;
+    const t2z = vx * t1y - vy * t1x;
+    const s2 = sigma * sigma;
+    addCov(out, 0, t1x, t1y, t1z, s2);
+    addCov(out, 0, t2x, t2y, t2z, s2);
+    addCov(out, 0, vx, vy, vz, s2 * 0.02);
+  };
+
+  // ---------- fine layer ----------
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    const ym = Math.max(y - 1, 0), yp = Math.min(y + 1, h - 1);
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      const a = rgba[i * 4 + 3];
+      if (a < 8) continue; // transparent source pixel
+      const z = depth[i];
+      const [px, py, pz] = unproject(x + 0.5, y + 0.5, z);
+      const sigma0 = sizeFactor * z / f;
+      const r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
+
+      if (edges[i]) {
+        // silhouette: isotropic camera-facing, feathered
+        facingCov(px, py, pz, sigma0 * 0.9, c6);
+        emit(px, py, pz, c6, r, g, b, 200);
+        continue;
+      }
+
+      const xm = Math.max(x - 1, 0), xp = Math.min(x + 1, w - 1);
+      const zu = dz(i, row + xp, row + xm, disp[i], disp[row + xp], disp[row + xm],
+        z, depth[row + xp], depth[row + xm]);
+      const zv = dz(i, yp * w + x, ym * w + x, disp[i], disp[yp * w + x], disp[ym * w + x],
+        z, depth[yp * w + x], depth[ym * w + x]);
+
+      // surface tangents from the parameterized depth grid
+      const u = x + 0.5 - cx, v = y + 0.5 - cy;
+      // dP/du, dP/dv (see docs in scratchpad; camera looks -Z, y flipped)
+      const dux = z / f + u * zu / f, duy = -v * zu / f, duz = -zu;
+      const dvx = u * zv / f, dvy = -z / f - v * zv / f, dvz = -zv;
+      // normal = cross(dPdu, dPdv), oriented toward camera
+      let nx = duy * dvz - duz * dvy;
+      let ny = duz * dvx - dux * dvz;
+      let nz = dux * dvy - duy * dvx;
+      const nl = Math.hypot(nx, ny, nz) || 1;
+      nx /= nl; ny /= nl; nz /= nl;
+      if (nx * px + ny * py + nz * pz > 0) { nx = -nx; ny = -ny; nz = -nz; }
+
+      const pl = Math.hypot(px, py, pz) || 1;
+      const vx = -px / pl, vy = -py / pl, vz = -pz / pl;
+      let cosT = nx * vx + ny * vy + nz * vz;
+      if (cosT < 0) cosT = 0;
+
+      // tilt direction: view dir projected into the tangent plane
+      let t1x = vx - nx * cosT, t1y = vy - ny * cosT, t1z = vz - nz * cosT;
+      const t1l = Math.hypot(t1x, t1y, t1z);
+      if (t1l < 1e-4) {
+        facingCov(px, py, pz, sigma0, c6);
+        emit(px, py, pz, c6, r, g, b, 255);
+        continue;
+      }
+      t1x /= t1l; t1y /= t1l; t1z /= t1l;
+      const t2x = ny * t1z - nz * t1y;
+      const t2y = nz * t1x - nx * t1z;
+      const t2z = nx * t1y - ny * t1x;
+
+      const s1 = sigma0 / Math.max(cosT, 0.35);
+      c6.fill(0);
+      addCov(c6, 0, t1x, t1y, t1z, s1 * s1);
+      addCov(c6, 0, t2x, t2y, t2z, sigma0 * sigma0);
+      addCov(c6, 0, nx, ny, nz, sigma0 * sigma0 * 0.02);
+      emit(px, py, pz, c6, r, g, b, 255);
+    }
+  }
+  const fineCount = n;
+
+  // ---------- background (disocclusion) layer ----------
+  if (params.withBg && bg) {
+    const bgDepth = disparityToDepth(bg.bgDisp, params.zNear, params.zRange);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        if (!bg.bgMask[i]) continue;
+        const z = bgDepth[i];
+        const [px, py, pz] = unproject(x + 0.5, y + 0.5, z);
+        const sigma = sizeFactor * z / f * 1.7;
+        facingCov(px, py, pz, sigma, c6);
+        emit(px, py, pz, c6, bg.bgColor[i * 4], bg.bgColor[i * 4 + 1], bg.bgColor[i * 4 + 2], 245);
+      }
+    }
+  }
+  const bgCount = n - fineCount;
+
+  // ---------- coarse underlayer (fills cracks when dollying in) ----------
+  if (params.withUnder) {
+    for (let y = underStep >> 1; y < h; y += underStep) {
+      for (let x = underStep >> 1; x < w; x += underStep) {
+        const i = y * w + x;
+        if (rgba[i * 4 + 3] < 8) continue;
+        const z = depth[i] * 1.012; // nudged behind the fine layer
+        const [px, py, pz] = unproject(x + 0.5, y + 0.5, z);
+        const sigma = sizeFactor * z / f * underStep * 0.8;
+        facingCov(px, py, pz, sigma, c6);
+        emit(px, py, pz, c6, rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2], 255);
+      }
+    }
+  }
+  const underCount = n - fineCount - bgCount;
+
+  // ---------- border skirt (mirrored fading outpaint) ----------
+  if (skirtPx > 0) {
+    const mirror = (v, size) => {
+      let m = v;
+      if (m < 0) m = -m - 1;
+      if (m >= size) m = 2 * size - 1 - m;
+      return Math.min(Math.max(m, 0), size - 1);
+    };
+    for (let y = -skirtPx; y < h + skirtPx; y += 2) {
+      for (let x = -skirtPx; x < w + skirtPx; x += 2) {
+        if (x >= 0 && x < w && y >= 0 && y < h) continue;
+        const sx = mirror(x, w), sy = mirror(y, h);
+        const i = sy * w + sx;
+        if (rgba[i * 4 + 3] < 8) continue;
+        const distOut = Math.max(x < 0 ? -x : x - w + 1, y < 0 ? -y : y - h + 1, 0);
+        const fade = Math.pow(1 - Math.min(distOut / skirtPx, 1), 1.6);
+        const alpha = Math.round(235 * fade);
+        if (alpha < 10) continue;
+        const z = depth[i];
+        const [px, py, pz] = unproject(x + 0.5, y + 0.5, z);
+        const sigma = sizeFactor * z / f * 2.4;
+        facingCov(px, py, pz, sigma, c6);
+        const shade = 0.92;
+        emit(px, py, pz, c6,
+          rgba[i * 4] * shade, rgba[i * 4 + 1] * shade, rgba[i * 4 + 2] * shade, alpha);
+      }
+    }
+  }
+
+  const meta = {
+    fineCount, bgCount, underCount, skirtCount: n - fineCount - bgCount - underCount,
+    centerZ: depth[(Math.floor(cy) * w + Math.floor(cx))],
+    medianZ: percentile(depth, 0.5),
+    nearZ: percentile(depth, 0.03),
+    farZ: percentile(depth, 0.97),
+    focalPx: f, width: w, height: h,
+  };
+
+  return {
+    count: n,
+    positions: positions.slice(0, n * 3),
+    cov: cov.slice(0, n * 6),
+    colors: colors.slice(0, n * 4),
+    meta,
+  };
+}
