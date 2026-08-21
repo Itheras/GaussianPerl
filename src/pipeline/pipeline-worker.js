@@ -6,9 +6,24 @@ import {
 } from './depthproc.js';
 import { synthesizeBackground } from './inpaint.js';
 import { buildSplats } from './splat-build.js';
+import { encodeSplatFile } from '../io/save.js';
 
 self.onmessage = (e) => {
   const msg = e.data;
+  if (msg.type === 'export') {
+    try {
+      const bytes = encodeSplatFile({
+        count: msg.count,
+        positions: new Float32Array(msg.positions),
+        cov: new Float32Array(msg.cov),
+        colors: new Uint8Array(msg.colors),
+      });
+      self.postMessage({ type: 'exported', id: msg.id, bytes }, [bytes.buffer]);
+    } catch (err) {
+      self.postMessage({ type: 'error', id: msg.id, message: String(err && err.stack || err) });
+    }
+    return;
+  }
   if (msg.type !== 'build') return;
   const { id, w, h, params } = msg;
   const rgba = new Uint8ClampedArray(msg.rgba);

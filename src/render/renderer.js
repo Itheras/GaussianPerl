@@ -279,7 +279,12 @@ export class SplatRenderer {
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
 
     const keepW = this.fboW, keepH = this.fboH;
-    this._renderInto(state, fbo, w, h);
+    // CoC is computed in render-target pixels: scale DoF to capture resolution
+    const eff = w / this.canvas.width;
+    const st = ((state.dofStrength ?? 0) > 0 && eff !== 1)
+      ? { ...state, dofStrength: state.dofStrength * eff, maxCoC: (state.maxCoC ?? 22) * eff }
+      : state;
+    this._renderInto(st, fbo, w, h);
 
     const pixels = new Uint8ClampedArray(w * h * 4);
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
