@@ -34,7 +34,7 @@ export const DEFAULTS = {
   // pipeline
   edgeDispJump: 0.055,  // disparity jump (fraction of full range) => discontinuity
   bgBandPx: 0,          // 0 = auto (~7% of the short side, clamped 12..56)
-  skirtPx: 24,          // border outpaint skirt width (in working pixels)
+  skirtPx: 0,           // 0 = auto (~10% of the short side, clamped 16..88)
   underlayerStep: 4,    // downsample step for the crack-filling underlayer
 };
 

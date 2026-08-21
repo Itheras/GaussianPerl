@@ -486,6 +486,6 @@ if (urlParams.has('demo')) openSample();
 
 // expose for e2e tests
 window.__gp = {
-  app, controls, renderer, settings,
+  app, controls, renderer, settings, openBlob,
   captureNow: (scale = 1) => renderer.capture(renderState(canvas.width, canvas.height), scale),
 };

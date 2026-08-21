@@ -62,6 +62,10 @@ self.onmessage = (e) => {
     }
 
     post('build', 0.7);
+    // skirt width scales with resolution (fixed px would vanish at high res)
+    if (params.withSkirt && !params.skirtPx) {
+      params.skirtPx = Math.max(16, Math.min(88, Math.round(Math.min(w, h) * 0.1)));
+    }
     const cloud = buildSplats({ rgba, w, h, disp, edges, bg, params });
 
     post('done', 1);
