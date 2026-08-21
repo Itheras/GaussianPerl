@@ -87,6 +87,40 @@ export function buildSplats({ rgba, w, h, disp, edges, bg, params }) {
     addCov(out, 0, vx, vy, vz, s2 * 0.02);
   };
 
+  // surface-oriented disc: tangent frame from the depth-field gradient (zu, zv),
+  // stretched 1/cos(theta) along the tilt so grazing surfaces stay closed.
+  // Falls back to camera-facing when the normal is degenerate or view-aligned.
+  const orientedCov = (x, y, z, zu, zv, px, py, pz, sigma0, out) => {
+    const u = x + 0.5 - cx, v = y + 0.5 - cy;
+    const dux = z / f + u * zu / f, duy = -v * zu / f, duz = -zu;
+    const dvx = u * zv / f, dvy = -z / f - v * zv / f, dvz = -zv;
+    let nx = duy * dvz - duz * dvy;
+    let ny = duz * dvx - dux * dvz;
+    let nz = dux * dvy - duy * dvx;
+    const nl = Math.hypot(nx, ny, nz) || 1;
+    nx /= nl; ny /= nl; nz /= nl;
+    if (nx * px + ny * py + nz * pz > 0) { nx = -nx; ny = -ny; nz = -nz; }
+    const pl = Math.hypot(px, py, pz) || 1;
+    const vx = -px / pl, vy = -py / pl, vz = -pz / pl;
+    let cosT = nx * vx + ny * vy + nz * vz;
+    if (cosT < 0) cosT = 0;
+    let t1x = vx - nx * cosT, t1y = vy - ny * cosT, t1z = vz - nz * cosT;
+    const t1l = Math.hypot(t1x, t1y, t1z);
+    if (t1l < 1e-4) {
+      facingCov(px, py, pz, sigma0, out);
+      return;
+    }
+    t1x /= t1l; t1y /= t1l; t1z /= t1l;
+    const t2x = ny * t1z - nz * t1y;
+    const t2y = nz * t1x - nx * t1z;
+    const t2z = nx * t1y - ny * t1x;
+    const s1 = sigma0 / Math.max(cosT, 0.35);
+    out.fill(0);
+    addCov(out, 0, t1x, t1y, t1z, s1 * s1);
+    addCov(out, 0, t2x, t2y, t2z, sigma0 * sigma0);
+    addCov(out, 0, nx, ny, nz, sigma0 * sigma0 * 0.02);
+  };
+
   // ---------- fine layer ----------
   for (let y = 0; y < h; y++) {
     const row = y * w;
@@ -112,43 +146,7 @@ export function buildSplats({ rgba, w, h, disp, edges, bg, params }) {
         z, depth[row + xp], depth[row + xm]);
       const zv = dz(i, yp * w + x, ym * w + x, disp[i], disp[yp * w + x], disp[ym * w + x],
         z, depth[yp * w + x], depth[ym * w + x]);
-
-      // surface tangents from the parameterized depth grid
-      const u = x + 0.5 - cx, v = y + 0.5 - cy;
-      // dP/du, dP/dv (see docs in scratchpad; camera looks -Z, y flipped)
-      const dux = z / f + u * zu / f, duy = -v * zu / f, duz = -zu;
-      const dvx = u * zv / f, dvy = -z / f - v * zv / f, dvz = -zv;
-      // normal = cross(dPdu, dPdv), oriented toward camera
-      let nx = duy * dvz - duz * dvy;
-      let ny = duz * dvx - dux * dvz;
-      let nz = dux * dvy - duy * dvx;
-      const nl = Math.hypot(nx, ny, nz) || 1;
-      nx /= nl; ny /= nl; nz /= nl;
-      if (nx * px + ny * py + nz * pz > 0) { nx = -nx; ny = -ny; nz = -nz; }
-
-      const pl = Math.hypot(px, py, pz) || 1;
-      const vx = -px / pl, vy = -py / pl, vz = -pz / pl;
-      let cosT = nx * vx + ny * vy + nz * vz;
-      if (cosT < 0) cosT = 0;
-
-      // tilt direction: view dir projected into the tangent plane
-      let t1x = vx - nx * cosT, t1y = vy - ny * cosT, t1z = vz - nz * cosT;
-      const t1l = Math.hypot(t1x, t1y, t1z);
-      if (t1l < 1e-4) {
-        facingCov(px, py, pz, sigma0, c6);
-        emit(px, py, pz, c6, r, g, b, 255);
-        continue;
-      }
-      t1x /= t1l; t1y /= t1l; t1z /= t1l;
-      const t2x = ny * t1z - nz * t1y;
-      const t2y = nz * t1x - nx * t1z;
-      const t2z = nx * t1y - ny * t1x;
-
-      const s1 = sigma0 / Math.max(cosT, 0.35);
-      c6.fill(0);
-      addCov(c6, 0, t1x, t1y, t1z, s1 * s1);
-      addCov(c6, 0, t2x, t2y, t2z, sigma0 * sigma0);
-      addCov(c6, 0, nx, ny, nz, sigma0 * sigma0 * 0.02);
+      orientedCov(x, y, z, zu, zv, px, py, pz, sigma0, c6);
       emit(px, py, pz, c6, r, g, b, 255);
     }
   }
@@ -157,15 +155,33 @@ export function buildSplats({ rgba, w, h, disp, edges, bg, params }) {
   // ---------- background (disocclusion) layer ----------
   if (params.withBg && bg) {
     const bgDepth = disparityToDepth(bg.bgDisp, params.zNear, params.zRange);
+    // depth-field gradient within the mask, so fills continue the background
+    // surface's slant (camera-facing discs open into a dashed lattice at
+    // grazing angles)
+    const bgGrad = (i, iA, iB) => {
+      const okA = bg.bgMask[iA] && Math.abs(bg.bgDisp[iA] - bg.bgDisp[i]) < jump;
+      const okB = bg.bgMask[iB] && Math.abs(bg.bgDisp[iB] - bg.bgDisp[i]) < jump;
+      if (okA && okB) return (bgDepth[iA] - bgDepth[iB]) * 0.5;
+      if (okA) return bgDepth[iA] - bgDepth[i];
+      if (okB) return bgDepth[i] - bgDepth[iB];
+      return 0;
+    };
+    const shade = 0.94; // disoccluded areas read naturally as soft shadow
     for (let y = 0; y < h; y++) {
+      const ym = Math.max(y - 1, 0), yp = Math.min(y + 1, h - 1);
       for (let x = 0; x < w; x++) {
         const i = y * w + x;
         if (!bg.bgMask[i]) continue;
         const z = bgDepth[i];
         const [px, py, pz] = unproject(x + 0.5, y + 0.5, z);
-        const sigma = sizeFactor * z / f * 1.7;
-        facingCov(px, py, pz, sigma, c6);
-        emit(px, py, pz, c6, bg.bgColor[i * 4], bg.bgColor[i * 4 + 1], bg.bgColor[i * 4 + 2], 245);
+        const xm = Math.max(x - 1, 0), xp = Math.min(x + 1, w - 1);
+        const zu = bgGrad(i, y * w + xp, y * w + xm);
+        const zv = bgGrad(i, yp * w + x, ym * w + x);
+        const sigma = sizeFactor * z / f * 1.35;
+        orientedCov(x, y, z, zu, zv, px, py, pz, sigma, c6);
+        emit(px, py, pz, c6,
+          bg.bgColor[i * 4] * shade, bg.bgColor[i * 4 + 1] * shade,
+          bg.bgColor[i * 4 + 2] * shade, 252);
       }
     }
   }

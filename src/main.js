@@ -145,6 +145,12 @@ function status(text, busy = false, autoHideMs = 0) {
 }
 
 // ---------- pipeline flow ----------
+function maxPixels() {
+  const q = QUALITY[settings.quality] || QUALITY.medium;
+  const override = parseInt(urlParams.get('maxpx') || '', 10);
+  return Number.isFinite(override) && override >= 10000 ? override : q.maxPixels;
+}
+
 function buildParams() {
   const q = QUALITY[settings.quality] || QUALITY.medium;
   return {
@@ -232,8 +238,7 @@ async function ensureEstimator() {
 async function openBlob(blob) {
   try {
     status('Reading photo…', true);
-    const q = QUALITY[settings.quality] || QUALITY.medium;
-    const { imageData } = await loadImageBlob(blob, q.maxPixels);
+    const { imageData } = await loadImageBlob(blob, maxPixels());
     app.source = { sample: false, blob };
     app.imageData = imageData;
 
@@ -259,8 +264,7 @@ async function openBlob(blob) {
 async function openSample() {
   try {
     status('Loading sample…', true);
-    const q = QUALITY[settings.quality] || QUALITY.medium;
-    const { imageData, disparity } = await loadSample(q.maxPixels);
+    const { imageData, disparity } = await loadSample(maxPixels());
     app.source = { sample: true };
     app.imageData = imageData;
     app.disparity = disparity;

@@ -68,6 +68,40 @@ export function disparityToDepth(disp, zNear, zRange) {
 }
 
 /**
+ * Snap soft disparity ramps at discontinuities back into steps: wherever the
+ * local 3x3 range exceeds ~the discontinuity threshold, move the value to the
+ * nearer of (local min, local max). Kills the mixed-depth "streak" splats that
+ * bilinear resampling (and soft AI output) creates along silhouettes.
+ */
+export function snapDepthEdges(disp, w, h, jump, iterations = 2) {
+  let cur = disp;
+  for (let it = 0; it < iterations; it++) {
+    const out = new Float32Array(cur.length);
+    for (let y = 0; y < h; y++) {
+      const ym = Math.max(y - 1, 0), yp = Math.min(y + 1, h - 1);
+      for (let x = 0; x < w; x++) {
+        const xm = Math.max(x - 1, 0), xp = Math.min(x + 1, w - 1);
+        let lo = Infinity, hi = -Infinity;
+        for (const yy of [ym, y, yp]) {
+          const row = yy * w;
+          for (const xx of [xm, x, xp]) {
+            const v = cur[row + xx];
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+          }
+        }
+        const d = cur[y * w + x];
+        out[y * w + x] = (hi - lo > jump * 0.8)
+          ? ((d - lo < hi - d) ? lo : hi)
+          : d;
+      }
+    }
+    cur = out;
+  }
+  return cur;
+}
+
+/**
  * Discontinuity mask: 1 where the 4-neighborhood disparity jump exceeds
  * `jump` (in units of the [0,1] disparity range).
  */

@@ -3,6 +3,7 @@
 
 import {
   normalizeDisparity, heuristicDisparity, refineDisparity, edgeMask, fgBoundary,
+  snapDepthEdges,
 } from './depthproc.js';
 import { synthesizeBackground } from './inpaint.js';
 import { buildSplats } from './splat-build.js';
@@ -46,15 +47,18 @@ self.onmessage = (e) => {
 
     post('edges', 0.35);
     const jump = params.edgeDispJump;
+    // consolidate soft silhouette ramps into clean steps before edge detection
+    disp = snapDepthEdges(disp, w, h, jump, 2);
     const edges = edgeMask(disp, w, h, jump);
 
     let bg = null;
     if (params.withBg) {
       post('inpaint', 0.45);
       const fgB = fgBoundary(disp, w, h, jump);
-      bg = synthesizeBackground(rgba, disp, w, h, fgB, {
-        bandPx: params.bgBandPx, jump,
-      });
+      // band scales with resolution: parallax reveals ~11% of the short side
+      const bandPx = params.bgBandPx
+        || Math.max(12, Math.min(72, Math.round(Math.min(w, h) * 0.11)));
+      bg = synthesizeBackground(rgba, disp, w, h, fgB, { bandPx, jump });
     }
 
     post('build', 0.7);

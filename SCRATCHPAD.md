@@ -60,31 +60,68 @@ field with tap-to-focus), then **save a normal PNG** of the view you like.
 
 ## Milestone log
 
+### M5 — Tests + hardening (DONE)
+- 25 node unit tests (`node tests/run.mjs`): math, imageops, depthproc, inpaint,
+  splat-build, .splat export, PNG encoder, sort-worker (simulated via
+  `globalThis.self` shim).
+- Headless e2e (`node e2e/run-e2e.mjs`): Playwright + SwiftShader
+  (`--enable-unsafe-swiftshader`), serves repo, loads
+  `?demo=1&nomodel=1&nowiggle=1&quality=low&maxpx=140000`, asserts: build,
+  all four layers present, non-empty render with structure, drag orbits +
+  changes pixels, wheel dollies, dbl-click refocuses near→far, DoF changes
+  pixels, PNG encodes, .splat is count*32 bytes. Record shots in `e2e/out/`.
+- **Artifact hunt (important learnings, see gotchas below)** — fixed in order:
+  1. `[hidden]` elements resurrected by author `display:flex` → invisible
+     full-screen overlays swallowed all pointer events. Fix: `[hidden]{display:none!important}`.
+  2. Bilinear-downsampled disparity ⇒ mixed-depth "streak" splats along
+     silhouettes. Fix: `snapDepthEdges` decision filter (3×3 min/max snap).
+  3. Disocclusion fill averaged near+far march hits ⇒ mid-air "veil" sheets.
+     Fix: plain-median cluster selection (dominant background surface).
+  4. Ground's own smooth gradient passed the "farther than me" march test ⇒
+     phantom fills under open ground. Fix: hit only counts if the march
+     **crossed a discontinuity** (single-step drop > 0.8·jump).
+  5. Camera-facing fill discs opened into a dashed lattice at grazing angles.
+     Fix: orient fills by the bg depth-field gradient (shared `orientedCov`),
+     shade ×0.94, band auto-scales (~11% short side, clamp 12..72).
+
+### M4 — UI + save (DONE)
+- index.html/styles.css/main.js: toolbar, settings panel, welcome, status chip,
+  drag/paste, focus ring, safe-area + dvh. Save = offscreen 2× FBO render →
+  readPixels → 2D canvas → toBlob PNG (DoF scaled to capture res inside
+  renderer.capture). `.splat` export runs in the pipeline worker (eigendecomp).
+- URL params: `demo`, `nomodel`, `nowiggle`, `quality=low|medium|high`,
+  `maxpx=N` (test override). `window.__gp` exposes app/controls/renderer/captureNow.
+
+### M3 — Pipeline (DONE)
+- depth-ai.js: transformers.js v3 from jsdelivr CDN, Depth Anything V2 small,
+  webgpu/fp16 → wasm/q8 fallback chain, progress callback, null on failure.
+- pipeline-worker: normalize (percentile 1.5/98.5) → jointBilateral refine
+  (AI only) → snapDepthEdges → edgeMask/fgBoundary → synthesizeBackground →
+  buildSplats. Also handles 'export'.
+
+### M2 — Renderer + controls (DONE)
+- Instanced quads, data in RGBA32F/RG32F/RGBA8 textures fetched by sorted
+  index (uint attrib, divisor 1). EWA: Σ2D = (J·R)Σ(J·R)ᵀ + 0.3px lowpass,
+  2.5σ quads. MRT: premult color + (depth·α, α) with shared blend
+  ONE/ONE_MINUS_SRC_ALPHA. Composite pass: bg gradient + poisson-16 DoF
+  gather (scatter-as-gather weights, IGN rotation). RGBA16F targets with
+  RGBA8+encoded-depth fallback.
+- sort-worker: 65536-bucket counting sort, ping-pong index buffer transfer.
+- OrbitControls: Pointer Events (1-finger orbit / 2-finger pinch+pan /
+  right-or-shift-drag pan / wheel+ctrlKey trackpad pinch), inertia,
+  soft limits (yaw 0.5, pitch 0.38 — beyond that the illusion dies),
+  double-tap pick callback, idle wiggle until first interaction.
+
+### M1 — Sample assets + math utils (DONE)
+- Procedural golden-hour standing-stones scene, 1024×768, with exact GT
+  disparity (16-bit in R/G) — the offline/no-model demo path.
+- math3d (mat4 column-major, eigenSym3 Jacobi, matToQuat), imageops
+  (resize, box blur, joint bilateral, gradients, dilate, histogram percentile),
+  dep-free PNG encoder (None/Sub/Up filter heuristic).
+
 ### M0 — Skeleton (DONE)
 - Empty repo → branch `claude/gaussian-splat-single-image-0iwx6y`, skeleton,
   this scratchpad, README, .gitignore.
-
-### M1 — Sample assets + math utils (planned)
-- `tools/gen-sample.mjs`: node script, no deps — procedural scene → `assets/sample.png`
-  + `assets/sample_depth.png` (16-bit-ish GT disparity in 8-bit PNG), minimal PNG
-  encoder via zlib.
-- `src/util/math3d.js`, unit-testable in node.
-
-### M2 — Renderer + controls (planned)
-- WebGL2 instanced splatting, sort worker, orbit controls (mouse+touch), DoF composite.
-
-### M3 — Pipeline (planned)
-- depth-ai (transformers.js), depthproc, inpaint, splat-build, pipeline worker.
-
-### M4 — UI + save (planned)
-- Minimal overlay UI, quality presets, PNG capture (offscreen FBO + readPixels →
-  2D canvas → toBlob; iOS share sheet), `.splat` export (eigendecomp of Σ).
-
-### M5 — Tests + hardening (planned)
-- Node unit tests (math, sort, PNG encoder, eigendecomp round-trip).
-- Playwright headless e2e: serve, load `?demo=1&nomodel=1`, assert non-empty render,
-  drag changes pixels, capture works.
-- Multi-lens adversarial review (Safari/iOS compat, GL math, memory, UX) → fixes.
 
 ## Known platform gotchas (learned/anticipated)
 
@@ -103,7 +140,23 @@ field with tap-to-focus), then **save a normal PNG** of the view you like.
 - HEIC photos: iOS Safari decodes natively via `<img>`/createImageBitmap — just
   don't try to parse bytes ourselves.
 - transformers.js: import from CDN inside try/catch — app must still boot offline.
+- `[hidden]` + author `display:` rules: UA `[hidden]{display:none}` LOSES to any
+  author display rule. Keep the `[hidden]{display:none!important}` reset.
+- Headless e2e needs `--enable-unsafe-swiftshader` (Chromium ≥ 137) for WebGL2;
+  software rasterizing 0.5M splats is seconds/frame → e2e uses `maxpx=140000`.
+- GL screenshots: don't trust page.screenshot / toDataURL on the WebGL canvas
+  (no preserveDrawingBuffer); use `__gp.captureNow()` (offscreen FBO+readPixels).
+- Debug trick that found the lattice bug: re-upload the cloud with all layers
+  except one alpha-zeroed (`scratchpad debug-layers.mjs` pattern), render each
+  layer in isolation.
 
 ## Open questions / next steps
 
-- (none yet — fill in as they appear)
+- Mountains/horizon band on the sample still reads as terraced cardboard at
+  extreme yaw (>0.4) — inherent to giant far-depth cliffs; acceptable within
+  soft limits. Could compress far-field disparity nonlinearly if it bothers.
+- Fill brightness can mismatch surroundings slightly (haze-lightened pulls);
+  shading ×0.94 hides most of it.
+- transformers.js AI path is untested in the headless env (no model download
+  in CI) — verify on a real device when possible; the wasm-q8 fallback chain
+  is the risk area.

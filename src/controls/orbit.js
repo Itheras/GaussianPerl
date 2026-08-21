@@ -23,9 +23,10 @@ export class OrbitControls {
     this.pitch = 0;
     this.fovY = 55 * Math.PI / 180;
 
-    // limits (soft: rubber-band past these)
-    this.yawLimit = 0.85;
-    this.pitchLimit = 0.55;
+    // limits (soft: rubber-band past these) — single-image splats fall apart
+    // beyond ~30 degrees, so keep the reveal honest
+    this.yawLimit = 0.5;
+    this.pitchLimit = 0.38;
     this.minDistFactor = 0.3;
     this.maxDistFactor = 3.0;
 
