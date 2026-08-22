@@ -1,10 +1,11 @@
 # GaussianPerl 🫧
 
-Turn a **single photo** into an interactive **3D Gaussian splat** — right on your
+Turn a **single photo** into an interactive **3D photo** — right on your
 device. No server, no upload: local AI models run in your browser (WebGPU or
 WASM) — one estimates depth, another **generatively paints the areas the camera
-never saw** (behind foreground objects and beyond the frame) — and the result
-renders as a real gaussian splat you can orbit, refocus, and capture.
+never saw** (behind foreground objects and beyond the frame) — and a layered
+heightfield renderer replays the scene at the photo's own resolution as you
+move the camera, refocus, and capture.
 
 Built for **Mac (M-series)** and **iPhone** — everything is plain WebGL2 + ES
 modules, one codebase, mouse *and* touch.
@@ -26,31 +27,28 @@ On iPhone: serve from your Mac (`python3 -m http.server`) and open
 1. **Open** a photo (button, drag-drop, or paste) — or hit **Sample**.
 2. The depth model downloads once (~25 MB, cached), then everything runs locally.
 3. Navigate:
-   - **Mouse**: drag = orbit · right-drag / shift-drag = pan · wheel = dolly
-   - **Touch**: one finger = orbit · pinch = dolly · two-finger drag = pan
+   - **Mouse**: drag = look around (parallax) · wheel = dolly
+   - **Touch**: one finger = look around · pinch = dolly
    - **Double-click / double-tap**: set the focus distance (depth of field)
-4. Tune **Focus** and **Aperture** for the depth-of-field look, plus depth
-   strength, splat size, and field of view in the panel.
-5. **Save PNG** captures exactly what you see (2× supersampled). You can also
-   export a standard `.splat` file for other viewers.
+4. Tune **Focus** and **Aperture** for the depth-of-field look, and **3D
+   boost** for how far the camera may wander, in the panel.
+5. **Save PNG** captures exactly what you see (2× supersampled).
 
 ## How it works (the bag of tricks)
 
 | Stage | Trick |
 |---|---|
-| Depth | Depth Anything V2 via transformers.js, on-device (WebGPU→WASM; *base* model on desktop WebGPU, *small* elsewhere) |
-| Depth cleanup | Joint bilateral filter guided by image color — edges snap to color edges |
-| Far field | Disparity tail compression: distant mountains/sky become a coherent backdrop (real far fields don't parallax) |
-| Splats | Per-pixel anisotropic gaussians oriented by depth-normals, slant-stretched |
-| Silhouettes | Depth-discontinuity mask → isotropic, alpha-feathered edge splats |
-| Hidden data | **Generative fill**: MI-GAN inpainting (28 MB ONNX, onnxruntime-web) paints the background revealed by parallax — foreground is masked out of the model's context so it can't smear into the hole |
-| Fill realism | Low frequencies anchored to the classical fill estimate (kills GAN hallucinations), variance grain on top |
-| Image borders | **Generative outpaint**: the same model extends the scene beyond the frame onto a padded plate skirt |
-| Cracks | ×4-downsampled large-splat underlayer |
-| Render | Instanced EWA splatting, worker counting-sort, premultiplied back-to-front |
-| Focus | DoF post-pass from per-pixel composited depth, tap-to-focus |
-| Instant preview | Classical fill ships the first splat immediately; the AI-filled rebuild swaps in when ready |
-| Offline | Everything degrades gracefully: classical fill, mirrored skirt, heuristic depth — no network required |
+| Camera | The photo's own EXIF focal length; translation-only window camera (rotation is what shears faces); subject-plane convergence so the subject stays pixel-locked |
+| Depth | Depth Anything V2 via transformers.js, on-device (WebGPU→WASM; *base* on desktop WebGPU) |
+| Depth cleanup | Fast Global Smoother (no texture imprint) + weighted-median edge snapping + floater merge + image-edge relocation |
+| Far field | Disparity tail compression: distant content becomes a coherent backdrop (real far fields don't parallax) |
+| Render | Two-layer heightfield raymarch: one bilinear tap of the full-res photo per pixel — photo-native sharpness, structurally incapable of point-splat tearing |
+| Hidden data | **Generative fill**: MI-GAN inpainting (28 MB ONNX, onnxruntime-web) paints the background layer revealed by parallax; low frequencies anchored to a classical estimate |
+| Image borders | **Generative outpaint**: the same model extends the scene beyond the frame onto the padded layer ring |
+| Motion budget | Per-photo envelope: parallax ≤ ~3% of frame and never far past the fill coverage — dolly-dominant, the production recipe |
+| Focus | DoF post-pass from the marched depth, double-tap to refocus AND re-pivot |
+| Instant preview | Classical fill ships the first scene immediately; the AI layers swap in when ready |
+| Offline | Everything degrades gracefully: classical fill, mirrored ring, heuristic depth — no network required |
 
 Details and per-milestone notes: [`SCRATCHPAD.md`](SCRATCHPAD.md).
 
@@ -63,12 +61,12 @@ src/main.js           bootstrap + UI wiring
 src/config.js         quality presets, tunables
 src/util/             math3d, imageops (pure, node-testable)
 src/pipeline/         depth-ai (transformers.js), inpaint-ai (MI-GAN via
-                      onnxruntime-web), fill-plan (masks/clusters/anchoring),
-                      depthproc, inpaint (classical), splat-build,
-                      pipeline-worker (owns both AI models)
-src/render/           WebGL2 renderer, shaders, sort-worker
-src/controls/         orbit controls (mouse + touch + inertia)
-src/io/               image load / PNG save / .splat export
+                      onnxruntime-web), depth-filter (FGS/median/relocation),
+                      fill-plan (masks/clusters/anchoring), layer-build,
+                      depthproc, inpaint (classical), pipeline-worker
+src/render/           WebGL2 two-layer heightfield raymarch renderer
+src/controls/         translation-only window camera (mouse + touch)
+src/io/               image load / EXIF intrinsics / PNG save
 assets/               generated sample image + ground-truth depth
 tools/gen-sample.mjs  regenerates the sample assets (node, no deps)
 tests/                node unit tests        (node tests/run.mjs)

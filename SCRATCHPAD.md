@@ -60,6 +60,71 @@ field with tap-to-focus), then **save a normal PNG** of the view you like.
 
 ## Milestone log
 
+### M8 — Layered heightfield: "indistinguishable under camera motion" (DONE)
+User verdict on M7.5 with a real 12MP photo: splat confetti at angles, severe
+face distortion under motion. 6-agent research pass (Kopf One-Shot 3D
+Photography, Shih LDI, SLIDE/3D-Moments, Immersity/DepthFlow shader tech, FGS/
+WLS depth filtering, EXIF geometry, frontier NVS) → decision: the artifacts are
+STRUCTURAL to point splats; production single-photo 3D ships layered textured
+representations with translation-only cameras. Full renderer cutover:
+- **Renderer: two-layer full-res LDI heightfield raymarch** (fullscreen FS,
+  the Immersity technique): layer 0 = photo + outpainted ring as TEXTURES
+  (color at working res, disparity at ≤1.75MP depth res, R16F linear — core
+  WebGL2), layer 1 = band-limited AI-filled background (feathered alpha).
+  Per-pixel inverse-depth march (48 steps + 7 binary refinements; both
+  parallax terms LINEAR in candidate disparity), gap detector (jump across the
+  last coarse step > 0.02·range·140/N) switches to the layer-1 march;
+  stretched layer-0 wall sample = never-void fallback. One bilinear tap of the
+  full-res photo per pixel: photo-native sharpness, NO sorting, NO popping,
+  and a heightfield CANNOT fragment — confetti is dead by construction.
+  Rest pose renders the photo pixel-exactly. sort-worker/splat-build/orbit/
+  .splat export deleted.
+- **Camera: translation-only window camera** (window-cam.js) — no rotation
+  ever (rotation converts focal error into (γ−1)·θ shear = the face-swimming
+  mechanism; translation-only novel views are pixel-exact under ANY focal
+  error). Subject-plane convergence (dConv; double-tap re-pivots): the face
+  stays pixel-locked (e2e asserts <2px shift across the FULL envelope), the
+  background does the moving. Dolly-dominant envelope (ez in +0.12/−0.05·Zs;
+  dolly opens almost no holes and carries the wow — verified: dolly-in
+  magnifies faces with zero distortion). Per-photo lateral envelope =
+  min(0.05·boost, 3%-of-frame parallax cap, 1.75× fill-coverage cap).
+- **EXIF intrinsics** (io/exif.js, exifr 7.1.3 CDN, JPEG+HEIC): render FoV =
+  capture FoV. FocalLengthIn35mmFormat clamped [10,250] (iOS garbage-value
+  bug), DigitalZoomRatio applied only on known base lenses, fallback
+  fPx=max(W,H) (53.13° long side). Test photo: iPhone XR 26mm → 67.3° (the
+  old assumed 55° was badly wrong).
+- **Depth stack** (depth-filter.js) replaced joint-bilateral refine (imprints
+  texture into geometry!) + 3×3 snap: (1) Fast Global Smoother — exact
+  tridiagonal Thomas solves H/V, T=3, λ schedule 1.5λ4^(T−t)/(4^T−1), gradient
+  conductance exp(−|dI|/7) — flattens interior noise with NO texture imprint;
+  (2) Kopf 5×5 weighted median w/ edge-sample rejection (ramps → 1px steps);
+  (3) floater CC merge (<20px·(min/384)² debris into largest-contact
+  neighbor — kills crowd-depth speckle); (4) gated edge relocation
+  (disparity-domain bilateral median at discontinuities, mutual-structure
+  gate: nearby image edge with orientation agreement <30°, gradient argmax
+  propagated over ~3px so offset boundaries still qualify).
+  Depth res ≤1.75MP END TO END (smooth field; sharpness comes from color).
+- **Mapping: subject-anchored reciprocal** Z = dSub/max(d, 0.04), Zs = 1
+  (subject units); dSub = center-box median disparity. depthStrength died;
+  the "3D boost" slider is a pure envelope gain, never geometry.
+- **Fill machinery unchanged** (MI-GAN, classical synth at depth res, anchor,
+  grain) — destination is now textures. CRITICAL lesson: the AI plate's
+  INTERIOR carries fill colors at bgMask pixels — layer 0 must stamp the
+  pristine photo over the interior (only the ring comes from the plate);
+  using the raw plate as color0 painted fills OVER the subjects (found by
+  JS-simulating the march against real worker buffers when the first browser
+  render showed ghost stones).
+- **Results** (12MP test photo, ultra): rest pose = the photo, exactly;
+  envelope corner = clean parallax, zero tearing/voids; dolly-in = faces
+  magnify undistorted. e2e rewritten for layers (pivot-lock assertion, pan/
+  dolly/refocus/DoF/PNG); 39 unit tests. Perf: fullscreen march ~96 taps/px
+  worst case — Immersity ships 5 layers×40 steps to phones; steps 48 desktop
+  / 28 mobile.
+- **Deferred to M9**: MoGe-2/DA3 geometry tier; person-matte planarization;
+  gyro (needs metric anchor); Distill-Any-Depth HQ swap (license + edges);
+  ring coverage for frame-edge-cut near subjects (residual stretch there);
+  dolly-zoom preset; envelope-edge fade.
+
 ### M7 — Generative fill: "the missing data must look real" (DONE)
 Goal: revealed/outpainted areas indistinguishable from the photo. Research
 (6-agent web workflow, findings verified with curl/graph inspection) → design →

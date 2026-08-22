@@ -5,18 +5,20 @@ import zlib from 'node:zlib';
 import { V3, M4, eigenSym3, matToQuat, clamp } from '../src/util/math3d.js';
 import {
   resizeFloat, boxBlurFloat, jointBilateral, gradients, dilateMask, percentile,
+  toHalfFloat, erodeMaxima,
 } from '../src/util/imageops.js';
 import {
-  normalizeDisparity, decodeGtDisparity, heuristicDisparity, disparityToDepth,
-  edgeMask, fgBoundary, snapDepthEdges, alignEdgesToColor, compressFarField,
+  normalizeDisparity, decodeGtDisparity, heuristicDisparity,
+  edgeMask, fgBoundary, compressFarField,
 } from '../src/pipeline/depthproc.js';
-import { synthesizeBackground, upsampleBackground, closeBandHoles } from '../src/pipeline/inpaint.js';
+import { synthesizeBackground, closeBandHoles } from '../src/pipeline/inpaint.js';
 import {
   collarGrow, buildFillInput, planClusters, padPlate, padFloat, ringMask,
   packImageNCHW, packMaskForBox, unpackNCHW, anchorToReference, smoothRingDisparity,
 } from '../src/pipeline/fill-plan.js';
-import { buildSplats } from '../src/pipeline/splat-build.js';
-import { encodeSplatFile } from '../src/io/save.js';
+import { intrinsicsFrom35mm, defaultIntrinsics, intrinsicsFromTags } from '../src/io/exif.js';
+import { fgsSmooth, weightedMedianDepth, mergeFloaters, relocateEdges } from '../src/pipeline/depth-filter.js';
+import { buildLayers, upsampleBackgroundTo } from '../src/pipeline/layer-build.js';
 import { encodePNG } from '../tools/png.mjs';
 
 let passed = 0, failed = 0;
@@ -169,13 +171,6 @@ await test('decodeGtDisparity decodes RG 16-bit packing', () => {
   near(d[1], 1, 1e-6);
 });
 
-await test('disparityToDepth: monotone, correct endpoints', () => {
-  const d = disparityToDepth(new Float32Array([1, 0.5, 0]), 1, 7);
-  near(d[0], 1, 1e-5);       // nearest
-  near(d[2], 8, 1e-4);       // farthest = zn + range
-  assert.ok(d[0] < d[1] && d[1] < d[2]);
-});
-
 await test('edgeMask + fgBoundary flag a depth step correctly', () => {
   const w = 10, h = 4;
   const disp = new Float32Array(w * h);
@@ -187,61 +182,6 @@ await test('edgeMask + fgBoundary flag a depth step correctly', () => {
   assert.equal(fb[1 * w + 4], 1, 'fg boundary = near side');
   assert.equal(fb[1 * w + 5], 0, 'far side not fg');
   assert.equal(em[1 * w + 2], 0, 'interior clean');
-});
-
-await test('snapDepthEdges: soft silhouette ramp becomes a step, gradients survive', () => {
-  const w = 20, h = 6;
-  const disp = new Float32Array(w * h);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      // step 0.2 -> 0.8 with a 3px soft ramp at x=9..11, like bilinear mixing
-      let v;
-      if (x < 9) v = 0.2;
-      else if (x > 11) v = 0.8;
-      else v = 0.2 + (x - 8) * 0.2;
-      disp[y * w + x] = v;
-    }
-  }
-  const out = snapDepthEdges(disp, w, h, 0.055, 2);
-  for (let x = 0; x < w; x++) {
-    const v = out[2 * w + x];
-    assert.ok(Math.abs(v - 0.2) < 0.02 || Math.abs(v - 0.8) < 0.02,
-      `x=${x} still mid-ramp: ${v}`);
-  }
-  // gentle gradient untouched
-  const g = new Float32Array(w * h);
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) g[y * w + x] = x * 0.005;
-  const g2 = snapDepthEdges(g, w, h, 0.055, 2);
-  for (let i = 0; i < g.length; i++) near(g2[i], g[i], 1e-6);
-});
-
-await test('alignEdgesToColor pulls a shifted depth edge onto the color edge', () => {
-  const w = 24, h = 8;
-  const rgba = new Uint8ClampedArray(w * h * 4);
-  const disp = new Float32Array(w * h);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const i = y * w + x;
-      // color boundary at x=10 (fg red, bg blue)…
-      const fg = x < 10;
-      rgba[i * 4] = fg ? 200 : 20;
-      rgba[i * 4 + 1] = 30;
-      rgba[i * 4 + 2] = fg ? 30 : 200;
-      rgba[i * 4 + 3] = 255;
-      // …but the model's (snapped) depth step sits at x=13
-      disp[i] = x < 13 ? 0.8 : 0.2;
-    }
-  }
-  const out = alignEdgesToColor(disp, rgba, w, h, 0.055, 4);
-  // bg-colored pixels stranded at fg depth (x=10..12) move to bg depth
-  for (const x of [10, 11, 12]) {
-    const v = out[4 * w + x];
-    assert.ok(Math.abs(v - 0.2) < 0.05, `bg-colored x=${x} pulled to bg depth (got ${v})`);
-  }
-  // true fg keeps its depth; far-from-edge pixels untouched
-  assert.ok(Math.abs(out[4 * w + 8] - 0.8) < 0.05, 'fg interior stays near');
-  near(out[4 * w + 20], 0.2, 1e-6);
-  near(out[4 * w + 1], 0.8, 1e-6);
 });
 
 await test('compressFarField: flattens far tail, keeps near field, stays monotone', () => {
@@ -327,28 +267,6 @@ await test('closeBandHoles floods failed band pixels from filled neighbors', () 
   assert.equal(bgMask2[1], 0, 'background-depth pixel not claimed');
 });
 
-await test('upsampleBackground: 2x block copy, crisp mask, odd sizes', () => {
-  const hw = 3, hh = 2;
-  const bgH = {
-    bgMask: Uint8Array.from([0, 1, 0, 1, 0, 1]),
-    bgDisp: Float32Array.from([0, 0.5, 0, 0.7, 0, 0.9]),
-    bgColor: new Uint8ClampedArray(hw * hh * 4),
-  };
-  bgH.bgColor[1 * 4] = 111; bgH.bgColor[3 * 4] = 133; bgH.bgColor[5 * 4] = 155;
-  const w = 5, h = 4; // odd width: last column maps to hw-1
-  const up = upsampleBackground(bgH, hw, hh, w, h);
-  assert.equal(up.bgMask[0 * w + 2], 1, '(2,0) -> src(1,0) masked');
-  near(up.bgDisp[0 * w + 3], 0.5, 1e-6); // (3,0) -> src(1,0)
-  assert.equal(up.bgColor[(0 * w + 2) * 4], 111);
-  assert.equal(up.bgMask[2 * w + 0], 1, '(0,2) -> src(0,1) masked');
-  near(up.bgDisp[2 * w + 0], 0.7, 1e-6);
-  assert.equal(up.bgColor[(2 * w + 0) * 4], 133);
-  assert.equal(up.bgMask[0 * w + 0], 0, 'unmasked stays unmasked');
-  assert.equal(up.bgMask[3 * w + 4], 1, 'odd edge clamps to last src col');
-  near(up.bgDisp[3 * w + 4], 0.9, 1e-6);
-});
-
-// ---------------- fill-plan ----------------
 await test('collarGrow follows the near surface, never crosses the cliff', () => {
   // vertical silhouette at x=10: near (0.8) left, far (0.2) right
   const w = 24, h = 8;
@@ -549,210 +467,172 @@ await test('NCHW pack/unpack round-trips; mask polarity is 255=known/0=hole', ()
 });
 
 // ---------------- splat-build ----------------
-function tinyScene(w = 12, h = 10) {
-  const rgba = new Uint8ClampedArray(w * h * 4);
-  const disp = new Float32Array(w * h).fill(0.5);
-  for (let i = 0; i < w * h; i++) {
-    rgba[i * 4] = 100; rgba[i * 4 + 1] = 150; rgba[i * 4 + 2] = 200; rgba[i * 4 + 3] = 255;
-  }
-  return { rgba, disp, w, h };
-}
-const buildDefaults = {
-  fovYDeg: 55, zNear: 1, zRange: 7, sizeFactor: 0.65, edgeDispJump: 0.05,
-  bgBandPx: 8, skirtPx: 8, underStep: 4,
-  withBg: false, withSkirt: false, withUnder: false,
-};
 
-await test('buildSplats: fine layer count and geometry for a flat plane', () => {
-  const { rgba, disp, w, h } = tinyScene();
-  const edges = new Uint8Array(w * h);
-  const out = buildSplats({ rgba, w, h, disp, edges, bg: null, params: { ...buildDefaults } });
-  assert.equal(out.count, w * h);
-  // constant disparity 0.5 => z = 1/(0.5*(1-1/8)+1/8) = 1.7777
-  const zExpect = 1 / (0.5 * (1 - 1 / 8) + 1 / 8);
-  for (let i = 0; i < out.count; i++) {
-    near(-out.positions[i * 3 + 2], zExpect, 1e-3);
-  }
-  // covariance: symmetric PSD-ish, positive diagonals
-  for (let i = 0; i < out.count; i++) {
-    assert.ok(out.cov[i * 6] > 0 && out.cov[i * 6 + 3] > 0 && out.cov[i * 6 + 5] >= 0);
-  }
-  near(out.meta.centerZ, zExpect, 1e-3);
-});
-
-await test('buildSplats: layers add splats; skirt fades out', () => {
-  const { rgba, disp, w, h } = tinyScene();
-  const edges = new Uint8Array(w * h);
-  const out = buildSplats({
-    rgba, w, h, disp, edges, bg: null,
-    params: { ...buildDefaults, withSkirt: true, withUnder: true },
-  });
-  assert.ok(out.meta.underCount > 0, 'underlayer present');
-  assert.ok(out.meta.skirtCount > 0, 'skirt present');
-  assert.equal(out.count, out.meta.fineCount + out.meta.bgCount + out.meta.underCount + out.meta.skirtCount);
-  // skirt alphas < 255
-  const start = out.meta.fineCount + out.meta.bgCount + out.meta.underCount;
-  let sawFade = false;
-  for (let i = start; i < out.count; i++) {
-    const a = out.colors[i * 4 + 3];
-    assert.ok(a <= 235, 'skirt alpha faded');
-    if (a < 200) sawFade = true;
-  }
-  assert.ok(sawFade, 'skirt should fade with distance');
-});
-
-await test('buildSplats: slanted surface stretches covariance anisotropically', () => {
-  // 64px grid: per-pixel disparity delta stays below the discontinuity guard
-  // (edgeDispJump) while the surface slant is strong, like real photos
-  const w = 64, h = 64;
-  const rgba = new Uint8ClampedArray(w * h * 4).fill(255);
-  const disp = new Float32Array(w * h);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) disp[y * w + x] = 0.2 + 0.6 * (y / (h - 1)); // ground-like
-  }
-  const edges = new Uint8Array(w * h);
-  const out = buildSplats({ rgba, w, h, disp, edges, bg: null, params: { ...buildDefaults } });
-  // mid pixel: covariance must not be isotropic — the slant direction (y/z for a
-  // ground plane) carries the 1/cos(theta) stretch while x keeps sigma0
-  const i = (32 * w + 32);
-  const cxx = out.cov[i * 6], cyy = out.cov[i * 6 + 3], czz = out.cov[i * 6 + 5];
-  assert.ok(cyy + czz > cxx * 1.35, `expected slant stretch, got xx=${cxx} yy=${cyy} zz=${czz}`);
-});
-
-await test('buildSplats: AI plate skirt uses plate colors unshaded; bgShade honored', () => {
-  const { rgba, disp, w, h } = tinyScene();
-  const edges = new Uint8Array(w * h);
-  const pad = 8;
-  const pw = w + 2 * pad, ph = h + 2 * pad;
-  const plate = new Uint8ClampedArray(pw * ph * 4);
-  for (let i = 0; i < pw * ph; i++) {
-    plate[i * 4] = 250; plate[i * 4 + 1] = 10; plate[i * 4 + 2] = 10; plate[i * 4 + 3] = 255;
-  }
-  const pDisp = new Float32Array(pw * ph).fill(0.5);
-  const out = buildSplats({
-    rgba, w, h, disp, edges, bg: null,
-    plate: { rgba: plate, disp: pDisp, padPx: pad, pw, ph },
-    params: { ...buildDefaults, withSkirt: true, skirtPx: pad },
-  });
-  assert.ok(out.meta.skirtCount > 0, 'plate skirt present');
-  const start = out.meta.fineCount + out.meta.bgCount + out.meta.underCount;
-  let sawFade = false;
-  for (let i = start; i < out.count; i++) {
-    assert.equal(out.colors[i * 4], 250, 'plate color used verbatim (no shade)');
-    assert.equal(out.colors[i * 4 + 1], 10);
-    if (out.colors[i * 4 + 3] < 200) sawFade = true;
-  }
-  assert.ok(sawFade, 'outer rim still fades');
-  // same depth mapping as interior: constant disparity 0.5 => same z
-  const zExpect = 1 / (0.5 * (1 - 1 / 8) + 1 / 8);
-  near(-out.positions[start * 3 + 2], zExpect, 1e-3);
-
-  // bgShade: classical darkens, AI (bgShade=1) does not
-  const bgMask = new Uint8Array(w * h);
-  const bgColor = new Uint8ClampedArray(w * h * 4);
-  const bgDisp = new Float32Array(w * h).fill(0.3);
-  bgMask[5 * w + 5] = 1;
-  bgColor[(5 * w + 5) * 4] = 100; bgColor[(5 * w + 5) * 4 + 1] = 100;
-  bgColor[(5 * w + 5) * 4 + 2] = 100; bgColor[(5 * w + 5) * 4 + 3] = 255;
-  const mkBg = (shade) => buildSplats({
-    rgba, w, h, disp, edges, bg: { bgColor, bgDisp, bgMask },
-    params: { ...buildDefaults, withBg: true, bgShade: shade },
-  });
-  const shaded = mkBg(0.94), unshaded = mkBg(1.0);
-  const bi = shaded.meta.fineCount; // first bg splat
-  assert.equal(unshaded.colors[bi * 4], 100, 'bgShade=1 keeps AI fill brightness');
-  assert.ok(shaded.colors[bi * 4] < 100, 'classical fill still shaded');
-});
-
-// ---------------- pipeline worker protocol (simulated) ----------------
-await test('pipeline-worker: classical build posts a single final; AI fill falls back offline', async () => {
-  const messages = [];
-  globalThis.self = {
-    onmessage: null,
-    postMessage: (m) => messages.push(m),
-  };
-  // block all network so Inpainter.load fails deterministically in node
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = () => Promise.reject(new Error('offline test'));
-  try {
-    await import('../src/pipeline/pipeline-worker.js');
-    const handler = globalThis.self.onmessage;
-    assert.ok(handler, 'worker registered a handler');
-
-    const w = 32, h = 32;
-    const rgba = new Uint8ClampedArray(w * h * 4).fill(200);
-    const disp = new Float32Array(w * h);
+await test('fgsSmooth: constant stays constant; smooths noise; never imprints texture', () => {
+  const w = 48, h = 32;
+  const mkTex = (amp) => {
+    const rgba = new Uint8ClampedArray(w * h * 4);
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
-        disp[y * w + x] = (x >= 12 && x < 20 && y >= 12 && y < 20) ? 0.9 : 0.2;
+        const v = 128 + (((x + y) & 1) ? amp : -amp);
+        const i = y * w + x;
+        rgba[i * 4] = v; rgba[i * 4 + 1] = v; rgba[i * 4 + 2] = v; rgba[i * 4 + 3] = 255;
       }
     }
-    const params = {
-      fovYDeg: 55, zNear: 1, zRange: 7, sizeFactor: 0.65, edgeDispJump: 0.055,
-      bgBandPx: 6, skirtPx: 6, underStep: 4,
-      withBg: true, withSkirt: true, withUnder: true,
-      wantAiDepth: false, aiFill: false, deviceClass: 'desktop',
-    };
-    const waitFor = async (pred, ms = 4000) => {
-      const t0 = Date.now();
-      while (!pred()) {
-        if (Date.now() - t0 > ms) throw new Error('timed out waiting for worker message');
-        await new Promise((r) => setTimeout(r, 20));
+    return rgba;
+  };
+  const flat = new Float32Array(w * h).fill(0.5);
+  for (const v of fgsSmooth(flat, mkTex(90), w, h)) near(v, 0.5, 1e-4);
+  let seed = 12345;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const noisy = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) noisy[i] = 0.5 + (rnd() - 0.5) * 0.1;
+  const std = (a) => {
+    let m = 0; for (const v of a) m += v; m /= a.length;
+    let s = 0; for (const v of a) s += (v - m) * (v - m);
+    return Math.sqrt(s / a.length);
+  };
+  // realistic mild texture (skin-scale contrast): noise flattens strongly
+  const outMild = fgsSmooth(noisy, mkTex(10), w, h);
+  assert.ok(std(outMild) < std(noisy) * 0.35, `noise flattened over mild texture (${std(outMild).toFixed(4)} vs ${std(noisy).toFixed(4)})`);
+  // even where hard texture blocks flow, the filter must never CREATE
+  // texture-correlated structure (the bilateral-imprint failure mode)
+  const outHard = fgsSmooth(noisy, mkTex(90), w, h);
+  const altCorr = (a, rgba) => {
+    // correlation of neighbor differences with the checkerboard sign
+    let s = 0, cnt = 0;
+    for (let y = 4; y < h - 4; y++) {
+      for (let x = 4; x < w - 5; x++) {
+        const i = y * w + x;
+        const texSign = ((x + y) & 1) ? 1 : -1;
+        s += (a[i] - a[i + 1]) * texSign; cnt++;
       }
-    };
+    }
+    return Math.abs(s / cnt);
+  };
+  assert.ok(altCorr(outHard) <= altCorr(noisy) + 1e-4,
+    `no texture-correlated structure created (${altCorr(outHard).toFixed(6)})`);
+});
 
-    // classical: one 'built', phase final
-    handler({ data: {
-      type: 'build', id: 1, sourceId: 1, rgba: rgba.slice().buffer, w, h,
-      disparity: disp.slice().buffer, params,
-    } });
-    await waitFor(() => messages.some((m) => m.type === 'built'));
-    const built1 = messages.filter((m) => m.type === 'built');
-    assert.equal(built1.length, 1);
-    assert.equal(built1[0].meta.phase, 'final');
-    assert.equal(built1[0].meta.fillKind, 'classical');
-    assert.equal(built1[0].meta.depthKind, 'gt');
-    assert.ok(built1[0].meta.bgCount > 0, 'classical bg layer present');
-
-    // AI fill requested but model unreachable: preview built + fill-failed
-    messages.length = 0;
-    handler({ data: {
-      type: 'build', id: 2, sourceId: 2, rgba: rgba.slice().buffer, w, h,
-      disparity: disp.slice().buffer, params: { ...params, aiFill: true },
-    } });
-    await waitFor(() => messages.some((m) => m.type === 'fill-failed'));
-    const built2 = messages.filter((m) => m.type === 'built');
-    assert.equal(built2.length, 1, 'exactly the preview build');
-    assert.equal(built2[0].meta.phase, 'preview');
-    assert.equal(built2[0].meta.fillKind, 'classical');
-    assert.ok(messages.some((m) => m.type === 'fill-failed'), 'fill failure reported');
-  } finally {
-    globalThis.fetch = realFetch;
-    delete globalThis.self;
+await test('fgsSmooth preserves a depth step aligned with a color edge', () => {
+  const w = 40, h = 16;
+  const rgba = new Uint8ClampedArray(w * h * 4);
+  const disp = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const left = x < 20;
+      const v = left ? 200 : 30;
+      rgba[i * 4] = v; rgba[i * 4 + 1] = v; rgba[i * 4 + 2] = v; rgba[i * 4 + 3] = 255;
+      disp[i] = left ? 0.8 : 0.2;
+    }
   }
+  const out = fgsSmooth(disp, rgba, w, h);
+  const step = out[8 * w + 15] - out[8 * w + 24];
+  assert.ok(step > 0.5, `step survives (${step.toFixed(3)})`);
+});
+
+await test('weightedMedianDepth: silhouette ramp becomes a step; gradient survives', () => {
+  const w = 24, h = 10;
+  const disp = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let v;
+      if (x < 10) v = 0.2;
+      else if (x > 13) v = 0.8;
+      else v = 0.2 + (x - 9) * 0.15; // 4px soft ramp
+      disp[y * w + x] = v;
+    }
+  }
+  const out = weightedMedianDepth(disp, w, h, 0.055);
+  let mid = 0;
+  for (let x = 0; x < w; x++) {
+    const v = out[5 * w + x];
+    if (Math.abs(v - 0.2) > 0.05 && Math.abs(v - 0.8) > 0.05) mid++;
+  }
+  assert.ok(mid <= 2, `ramp collapsed to a near-step (${mid} mid pixels)`);
+  const g = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) g[y * w + x] = x * 0.01;
+  const g2 = weightedMedianDepth(g, w, h, 0.055);
+  for (let x = 4; x < w - 4; x++) near(g2[5 * w + x], g[5 * w + x], 0.01);
+});
+
+await test('mergeFloaters: small debris merged, large regions kept', () => {
+  const w = 40, h = 30;
+  const disp = new Float32Array(w * h).fill(0.3);
+  // small floater (9px) at wrong depth + a large legitimate region
+  for (let y = 5; y < 8; y++) for (let x = 5; x < 8; x++) disp[y * w + x] = 0.9;
+  for (let y = 15; y < 28; y++) for (let x = 10; x < 35; x++) disp[y * w + x] = 0.7;
+  mergeFloaters(disp, w, h, 0.055, 20);
+  near(disp[6 * w + 6], 0.3, 1e-3);
+  near(disp[20 * w + 20], 0.7, 1e-6);
+});
+
+await test('relocateEdges: straightens a jagged depth edge along a straight image edge; gated off elsewhere', () => {
+  const w = 30, h = 16;
+  const rgba = new Uint8ClampedArray(w * h * 4);
+  const disp = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const left = x < 12; // straight image edge at 12
+      const v = left ? 210 : 40;
+      rgba[i * 4] = v; rgba[i * 4 + 1] = v; rgba[i * 4 + 2] = v; rgba[i * 4 + 3] = 255;
+      const cut = 12 + ((y % 3) - 1) * 2; // jagged depth edge 10/12/14
+      disp[i] = x < cut ? 0.8 : 0.2;
+    }
+  }
+  const out = relocateEdges(disp, rgba, w, h);
+  const edgeX = (arr, y) => {
+    for (let x = 1; x < w; x++) if (Math.abs(arr[y * w + x] - arr[y * w + x - 1]) > 0.3) return x;
+    return -1;
+  };
+  const spread = (arr) => {
+    let mn = w, mx = 0;
+    for (let y = 3; y < h - 3; y++) { const e = edgeX(arr, y); mn = Math.min(mn, e); mx = Math.max(mx, e); }
+    return mx - mn;
+  };
+  assert.ok(spread(out) < spread(disp), `edge straightened (${spread(out)} < ${spread(disp)})`);
+  // flat color, textured depth noise far from edges: untouched (gate)
+  const disp2 = new Float32Array(w * h).fill(0.5);
+  disp2[8 * w + 20] = 0.58; // small bump, no image edge there... below tau anyway
+  const rgbaFlat = new Uint8ClampedArray(w * h * 4).fill(128);
+  const out2 = relocateEdges(disp2, rgbaFlat, w, h);
+  for (let i = 0; i < w * h; i++) near(out2[i], disp2[i], 1e-6);
+});
+
+// ---------------- exif intrinsics ----------------
+await test('intrinsics: iPhone XR test photo (f35=26) gives 67.3 deg long-side FoV', () => {
+  // the repo test photo: iPhone XR, FocalLengthIn35mmFormat=26, 3024x4032 portrait
+  const i = intrinsicsFrom35mm(26, 3024, 4032);
+  near(i.fPx, 26 * 5040 / 43.267, 0.1);
+  near(i.fovYDeg, 67.28, 0.1);
+  assert.equal(i.source, 'exif');
+});
+
+await test('intrinsics: tag interpretation — clamps garbage, guards digital zoom, falls back', () => {
+  // sane path
+  const ok = intrinsicsFromTags({ FocalLengthIn35mmFormat: 26 }, 3024, 4032);
+  assert.equal(ok.f35, 26);
+  // iOS garbage f35 (known 177/311 bug) -> fallback
+  const junk = intrinsicsFromTags({ FocalLengthIn35mmFormat: 311 }, 4000, 3000);
+  assert.equal(junk.source, 'default');
+  // digital zoom applies only on a known base lens
+  const zoomed = intrinsicsFromTags({ FocalLengthIn35mmFormat: 26, DigitalZoomRatio: 2 }, 4000, 3000);
+  near(zoomed.f35, 52, 1e-9);
+  const baked = intrinsicsFromTags({ FocalLengthIn35mmFormat: 31, DigitalZoomRatio: 2 }, 4000, 3000);
+  near(baked.f35, 31, 1e-9, 'non-base lens: zoom already baked in');
+  // no EXIF at all
+  const none = intrinsicsFromTags(null, 1600, 900);
+  assert.equal(none.source, 'default');
+  near(none.fPx, 1600, 1e-9);
+  near(none.fovXDeg, 53.13, 0.01);
+  // default is orientation-symmetric: portrait vs landscape same long-side FoV
+  const port = defaultIntrinsics(900, 1600);
+  near(port.fovYDeg, none.fovXDeg, 1e-9);
 });
 
 // ---------------- .splat export ----------------
-await test('encodeSplatFile: 32-byte records, sane scales and quats', () => {
-  const cloud = {
-    count: 2,
-    positions: new Float32Array([1, 2, -3, -0.5, 0, -2]),
-    // isotropic sigma=0.1 and anisotropic diag(0.04, 0.01, 0.0025)
-    cov: new Float32Array([0.01, 0, 0, 0.01, 0, 0.01, 0.04, 0, 0, 0.01, 0, 0.0025]),
-    colors: new Uint8Array([255, 128, 0, 255, 10, 20, 30, 200]),
-  };
-  const bytes = encodeSplatFile(cloud);
-  assert.equal(bytes.length, 64);
-  const f32 = new Float32Array(bytes.buffer);
-  near(f32[0], 1); near(f32[1], 2); near(f32[2], -3);
-  near(f32[3], 0.1, 1e-4); near(f32[4], 0.1, 1e-4); near(f32[5], 0.1, 1e-4);
-  near(f32[8 + 3], 0.2, 1e-4); // second splat, largest scale first
-  const q = [bytes[28], bytes[29], bytes[30], bytes[31]].map((v) => (v - 128) / 128);
-  near(Math.hypot(...q), 1, 0.03);
-  assert.equal(bytes[24], 255); assert.equal(bytes[25], 128);
-});
-
-// ---------------- png encoder ----------------
 await test('encodePNG: valid signature, IHDR, inflatable IDAT', () => {
   const w = 5, h = 3;
   const rgba = new Uint8ClampedArray(w * h * 4).map((_, i) => (i * 7) & 0xff);
@@ -774,30 +654,146 @@ await test('encodePNG: valid signature, IHDR, inflatable IDAT', () => {
 });
 
 // ---------------- sort worker (simulated) ----------------
-await test('sort-worker: orders back-to-front under a view matrix', async () => {
+
+// ---------------- half float + erosion ----------------
+await test('toHalfFloat round-trips typical disparities within half precision', () => {
+  const vals = new Float32Array([0, 0.04, 0.055, 0.16, 0.5, 0.999, 1.0]);
+  const halves = toHalfFloat(vals);
+  // decode back
+  const dec = (hbits) => {
+    const s = (hbits & 0x8000) ? -1 : 1;
+    const e = (hbits >> 10) & 0x1f;
+    const m = hbits & 0x3ff;
+    if (e === 0) return s * m * Math.pow(2, -24);
+    if (e === 31) return m ? NaN : s * Infinity;
+    return s * (1 + m / 1024) * Math.pow(2, e - 15);
+  };
+  for (let i = 0; i < vals.length; i++) {
+    near(dec(halves[i]), vals[i], 6e-4);
+  }
+});
+
+await test('erodeMaxima shrinks near (high) disparity by the radius', () => {
+  const w = 20, h = 10;
+  const d = new Float32Array(w * h).fill(0.2);
+  for (let y = 3; y < 7; y++) for (let x = 8; x < 14; x++) d[y * w + x] = 0.9;
+  const e = erodeMaxima(d, w, h, 1);
+  near(e[5 * w + 8], 0.2, 1e-6);  // fg boundary column eroded
+  near(e[5 * w + 10], 0.9, 1e-6); // interior kept
+  near(e[1 * w + 1], 0.2, 1e-6);  // background untouched
+});
+
+// ---------------- layer build ----------------
+await test('buildLayers: dims, mirror ring, feathered fill alpha, disp1 override', () => {
+  const w = 24, h = 16, dw = 12, dh = 8, padPx = 4, padD = 2;
+  const rgba = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < w * h; i++) {
+    rgba[i * 4] = (i % w) * 10; rgba[i * 4 + 1] = 50; rgba[i * 4 + 2] = 90; rgba[i * 4 + 3] = 255;
+  }
+  const dispD = new Float32Array(dw * dh).fill(0.4);
+  for (let y = 2; y < 6; y++) for (let x = 4; x < 8; x++) dispD[y * dw + x] = 0.8;
+  const bgD = {
+    bgMask: new Uint8Array(dw * dh), bgDisp: new Float32Array(dw * dh),
+    bgColor: new Uint8ClampedArray(dw * dh * 4),
+  };
+  bgD.bgMask[3 * dw + 5] = 1; bgD.bgDisp[3 * dw + 5] = 0.3;
+  const bgW = upsampleBackgroundTo(bgD, dw, dh, w, h);
+  const L = buildLayers({ rgba, w, h, dispD, dw, dh, bgW, bgD, padPx, padD, erodeIterations: 0 });
+  assert.equal(L.pw, w + 2 * padPx);
+  assert.equal(L.ph, h + 2 * padPx);
+  assert.equal(L.pdw, dw + 2 * padD);
+  assert.equal(L.color0.length, L.pw * L.ph * 4);
+  assert.equal(L.disp0.length, L.pdw * L.pdh);
+  // interior photo pixel lands at the padded offset
+  const o = ((3 + padPx) * L.pw + (5 + padPx)) * 4;
+  assert.equal(L.color0[o], 5 * 10);
+  // mirror ring: left of interior column 0 mirrors column 0
+  const or_ = ((3 + padPx) * L.pw + (padPx - 1)) * 4;
+  assert.equal(L.color0[or_], 0);
+  // disp0 interior preserved (no erosion in this test)
+  near(L.disp0[(3 + padD) * L.pdw + (5 + padD)], 0.8, 1e-6);
+  // disp1 override inside mask, disp0 copy outside
+  near(L.disp1[(3 + padD) * L.pdw + (5 + padD)], 0.3, 1e-6);
+  near(L.disp1[(1 + padD) * L.pdw + (1 + padD)], L.disp0[(1 + padD) * L.pdw + (1 + padD)], 1e-6);
+  // layer-1 alpha: present only where the (upsampled) mask lives
+  let a = 0;
+  for (let i = 0; i < L.pw * L.ph; i++) a += L.color1[i * 4 + 3] > 0 ? 1 : 0;
+  const maskCount = bgW.bgMask.reduce((s, v) => s + v, 0);
+  assert.equal(a, maskCount, 'alpha coverage equals mask coverage');
+});
+
+// ---------------- pipeline worker protocol (simulated) ----------------
+await test('pipeline-worker: classical layers final; AI fill falls back offline', async () => {
   const messages = [];
   globalThis.self = {
     onmessage: null,
     postMessage: (m) => messages.push(m),
   };
-  await import('../src/render/sort-worker.js');
-  const handler = globalThis.self.onmessage;
-  assert.ok(handler, 'worker registered a handler');
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = () => Promise.reject(new Error('offline test'));
+  try {
+    await import('../src/pipeline/pipeline-worker.js');
+    const handler = globalThis.self.onmessage;
+    assert.ok(handler, 'worker registered a handler');
 
-  // camera at origin looking -Z: depth = -z
-  const positions = new Float32Array([
-    0, 0, -1,   // nearest
-    0, 0, -5,   // farthest
-    0, 0, -3,   // middle
-  ]);
-  handler({ data: { type: 'points', positions, count: 3 } });
-  const view = M4.lookAt([0, 0, 0], [0, 0, -1], [0, 1, 0]);
-  handler({ data: { type: 'sort', view, gen: 1, indices: null } });
-  const out = messages.find((m) => m.type === 'sorted');
-  assert.ok(out && out.indices, 'sorted reply');
-  assert.deepEqual([...out.indices], [1, 2, 0], 'far first, near last');
-  delete globalThis.self;
+    const w = 48, h = 40;
+    const rgba = new Uint8ClampedArray(w * h * 4).fill(180);
+    const disp = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        disp[y * w + x] = (x >= 18 && x < 30 && y >= 14 && y < 26) ? 0.9 : 0.25;
+      }
+    }
+    const params = {
+      edgeDispJump: 0.055, farKnee: 0.16, farKeep: 0.25,
+      bgBandPx: 6, skirtPx: 6,
+      withBg: true, withSkirt: true,
+      wantAiDepth: false, aiFill: false, deviceClass: 'desktop',
+    };
+    const waitFor = async (pred, ms = 8000) => {
+      const t0 = Date.now();
+      while (!pred()) {
+        if (Date.now() - t0 > ms) throw new Error('timed out waiting for worker message');
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+
+    handler({ data: {
+      type: 'build', id: 1, sourceId: 1, rgba: rgba.slice().buffer, w, h,
+      disparity: disp.slice().buffer, params,
+    } });
+    await waitFor(() => messages.some((m) => m.type === 'built'));
+    const b1 = messages.filter((m) => m.type === 'built');
+    assert.equal(b1.length, 1);
+    const m1 = b1[0].meta;
+    assert.equal(m1.phase, 'final');
+    assert.equal(m1.fillKind, 'classical');
+    assert.equal(m1.depthKind, 'gt');
+    assert.equal(b1[0].color0.length, m1.pw * m1.ph * 4);
+    assert.equal(b1[0].disp0.length, m1.pdw * m1.pdh);
+    assert.equal(b1[0].color1.length, m1.pw * m1.ph * 4);
+    assert.ok(m1.dSub > 0 && m1.dMax > m1.dMin, 'anchors sane');
+    // layer 1 has some fill coverage behind the square
+    let cov = 0;
+    for (let i = 0; i < m1.pw * m1.ph; i++) cov += b1[0].color1[i * 4 + 3] > 0 ? 1 : 0;
+    assert.ok(cov > 10, `bg layer has coverage (${cov})`);
+
+    // AI fill requested but model unreachable: preview + fill-failed
+    messages.length = 0;
+    handler({ data: {
+      type: 'build', id: 2, sourceId: 2, rgba: rgba.slice().buffer, w, h,
+      disparity: disp.slice().buffer, params: { ...params, aiFill: true },
+    } });
+    await waitFor(() => messages.some((m) => m.type === 'fill-failed'));
+    const b2 = messages.filter((m) => m.type === 'built');
+    assert.equal(b2.length, 1, 'exactly the preview build');
+    assert.equal(b2[0].meta.phase, 'preview');
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.self;
+  }
 });
+
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

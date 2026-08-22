@@ -183,33 +183,6 @@ function smoothWithinMask(bgColor, bgDisp, bgMask, w, h, jump) {
   }
 }
 
-/**
- * Nearest-upsample a half-res background synthesis to full res (2x block
- * copy). Masks stay crisp and the fields are smooth, so nearest is right —
- * bilinear would bleed zeros across the mask boundary. The AI fill repaints
- * colors at full res afterwards; only classical-kept slivers stay 2x blocky.
- */
-export function upsampleBackground(bgH, hw, hh, w, h) {
-  const bgColor = new Uint8ClampedArray(w * h * 4);
-  const bgDisp = new Float32Array(w * h);
-  const bgMask = new Uint8Array(w * h);
-  for (let y = 0; y < h; y++) {
-    const sy = Math.min(y >> 1, hh - 1);
-    for (let x = 0; x < w; x++) {
-      const sx = Math.min(x >> 1, hw - 1);
-      const si = sy * hw + sx, di = y * w + x;
-      if (!bgH.bgMask[si]) continue;
-      bgMask[di] = 1;
-      bgDisp[di] = bgH.bgDisp[si];
-      bgColor[di * 4] = bgH.bgColor[si * 4];
-      bgColor[di * 4 + 1] = bgH.bgColor[si * 4 + 1];
-      bgColor[di * 4 + 2] = bgH.bgColor[si * 4 + 2];
-      bgColor[di * 4 + 3] = 255;
-    }
-  }
-  return { bgColor, bgDisp, bgMask };
-}
-
 // subtle deterministic grain so the fill doesn't read as an airbrushed smear
 // (also applied over AI fills to hide the model's 512-crop softness)
 export function addGrain(bgColor, bgMask, w, h) {

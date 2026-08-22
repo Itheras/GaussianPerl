@@ -4,6 +4,7 @@
 import { resizeFloat } from '../util/imageops.js';
 import { decodeGtDisparity } from '../pipeline/depthproc.js';
 import { isSafariEngine } from '../config.js';
+import { readIntrinsics } from './exif.js';
 
 export function workingSize(natW, natH, maxPixels) {
   const scale = Math.min(1, Math.sqrt(maxPixels / (natW * natH)));
@@ -50,7 +51,7 @@ function drawToImageData(src, w, h) {
   return ctx.getImageData(0, 0, w, h);
 }
 
-/** blob -> {imageData} at working resolution */
+/** blob -> {imageData, intrinsics} at working resolution */
 export async function loadImageBlob(blob, maxPixels) {
   const src = await decodeToSource(blob);
   const natW = src.naturalWidth || src.width;
@@ -59,7 +60,10 @@ export async function loadImageBlob(blob, maxPixels) {
   const { w, h } = workingSize(natW, natH, maxPixels);
   const imageData = drawToImageData(src, w, h);
   if (src.close) src.close();
-  return { imageData, natW, natH };
+  // capture FoV from EXIF — dims are DISPLAYED (orientation already applied
+  // by the decoder above), which is what the focal math needs
+  const intrinsics = await readIntrinsics(blob, natW, natH);
+  return { imageData, natW, natH, intrinsics };
 }
 
 /** Bundled sample: image + ground-truth disparity (works fully offline). */

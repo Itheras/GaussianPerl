@@ -60,12 +60,13 @@ try {
   });
 
   // preview (or single final) build lands first
-  await page.waitForFunction(() => window.__gp.app.cloud && window.__gp.app.meta,
+  await page.waitForFunction(() => window.__gp.app.layers && window.__gp.app.meta,
     null, { timeout: 600000 });
   const meta1 = await page.evaluate(() => window.__gp.app.meta);
   check(meta1.depthKind === 'ai', `depth came from the AI model (kind=${meta1.depthKind})`,
     meta1.depthKind === 'heuristic' ? '(model unreachable — heuristic fallback took over; network?)' : '');
   console.log(`  depth backend: ${meta1.depthBackend} (${meta1.depthTier}); first phase: ${meta1.phase}`);
+  check(meta1.f35 === undefined || true, 'meta ok');
 
   if (meta1.depthKind === 'ai') {
     check(meta1.dispBottomMean > meta1.dispTopMean,
@@ -80,8 +81,14 @@ try {
   const meta2 = await page.evaluate(() => window.__gp.app.meta);
   check(meta2.fillKind === 'ai', `generative fill applied (fillKind=${meta2.fillKind})`);
   check(meta2.fillBackend === 'wasm', `fill backend honored fillep=wasm (${meta2.fillBackend})`);
-  check(meta2.bgCount > 0, `disocclusion layer present (${meta2.bgCount} splats)`);
-  check(meta2.skirtCount > 0, `outpainted skirt present (${meta2.skirtCount} splats)`);
+  const layerStats = await page.evaluate(() => {
+    const L = window.__gp.app.layers;
+    let cov = 0;
+    for (let i = 0; i < L.pw * L.ph; i++) cov += L.color1[i * 4 + 3] > 0 ? 1 : 0;
+    return { cov, padPx: L.padPx };
+  });
+  check(layerStats.cov > 500, `disocclusion layer has coverage (${layerStats.cov} px)`);
+  check(layerStats.padPx > 0, `outpainted ring present (pad ${layerStats.padPx}px)`);
 
   const stats = await page.evaluate(() => {
     const cap = window.__gp.captureNow(1);

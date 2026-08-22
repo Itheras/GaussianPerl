@@ -1,8 +1,10 @@
-// WebGL2 gaussian splat renderer.
-// Pass 1: instanced splat quads -> offscreen MRT (premult color + composited depth).
+// WebGL2 layered-heightfield renderer (M8).
+// Pass 1: fullscreen two-layer inverse-depth raymarch -> offscreen MRT
+//         (premult color + composited depth). No geometry, no sorting.
 // Pass 2: composite over background with optional depth-of-field gather.
 
-import { SPLAT_VS, SPLAT_FS, COMPOSITE_VS, COMPOSITE_FS, TEX_WIDTH } from './shaders.js';
+import { RAYMARCH_VS, RAYMARCH_FS, COMPOSITE_VS, COMPOSITE_FS } from './shaders.js';
+import { toHalfFloat } from '../util/imageops.js';
 
 const DEPTH_RANGE_8BIT = 64.0; // world units encodable in RGBA8 fallback mode
 
@@ -34,7 +36,7 @@ function uniforms(gl, prog, names) {
   return u;
 }
 
-export class SplatRenderer {
+export class LayerRenderer {
   constructor(canvas) {
     this.canvas = canvas;
     const gl = canvas.getContext('webgl2', {
@@ -48,8 +50,6 @@ export class SplatRenderer {
     this.onContextLost = null;
     this.onContextRestored = null;
 
-    // iOS Safari sheds GL contexts aggressively (backgrounding, memory
-    // pressure). preventDefault is REQUIRED or the context never restores.
     canvas.addEventListener('webglcontextlost', (e) => {
       e.preventDefault();
       this.contextLost = true;
@@ -58,7 +58,7 @@ export class SplatRenderer {
     canvas.addEventListener('webglcontextrestored', () => {
       this.contextLost = false;
       this._initGL();
-      if (this.onContextRestored) this.onContextRestored(); // re-upload cloud
+      if (this.onContextRestored) this.onContextRestored(); // re-upload layers
     });
 
     this._initGL();
@@ -66,8 +66,6 @@ export class SplatRenderer {
 
   _initGL() {
     const gl = this.gl;
-    // Float render targets: full float > half float > rgba8 (encoded depth).
-    // Extensions must be re-queried after a context restore.
     if (gl.getExtension('EXT_color_buffer_float')) {
       this.rtFormat = gl.RGBA16F; this.rtType = gl.HALF_FLOAT; this.depthEncoded = false;
     } else if (gl.getExtension('EXT_color_buffer_half_float')) {
@@ -76,10 +74,12 @@ export class SplatRenderer {
       this.rtFormat = gl.RGBA8; this.rtType = gl.UNSIGNED_BYTE; this.depthEncoded = true;
     }
 
-    this.progSplat = link(gl, SPLAT_VS, SPLAT_FS);
-    this.uSplat = uniforms(gl, this.progSplat, [
-      'uTexPos', 'uTexCovA', 'uTexCovB', 'uTexColor', 'uView', 'uProj',
-      'uFocal', 'uViewport', 'uSplatScale', 'uDepthEncode',
+    this.progMarch = link(gl, RAYMARCH_VS, RAYMARCH_FS);
+    this.uMarch = uniforms(gl, this.progMarch, [
+      'uColor0', 'uDisp0', 'uColor1', 'uDisp1',
+      'uCropScale', 'uCropOff', 'uFitScale', 'uFitOff',
+      'uKxy', 'uKz', 'uDConv', 'uDMin', 'uDMax', 'uDSub', 'uDFloor',
+      'uSteps', 'uDepthEncode',
     ]);
     this.progComp = link(gl, COMPOSITE_VS, COMPOSITE_FS);
     this.uComp = uniforms(gl, this.progComp, [
@@ -87,86 +87,59 @@ export class SplatRenderer {
       'uFocusDist', 'uDofStrength', 'uMaxCoC', 'uDepthDecode',
     ]);
 
-    this.vao = gl.createVertexArray();
-    gl.bindVertexArray(this.vao);
-    this.indexBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.indexBuf);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribIPointer(0, 1, gl.UNSIGNED_INT, 0, 0);
-    gl.vertexAttribDivisor(0, 1);
-    gl.bindVertexArray(null);
-
-    this.vaoEmpty = gl.createVertexArray(); // composite pass: no attribs
+    this.vaoEmpty = gl.createVertexArray();
 
     // after a context loss every old GL object is invalid — drop references
-    this.texPos = null; this.texCovA = null; this.texCovB = null; this.texColor = null;
-    this.count = 0;
-    this.instanceCount = 0;
+    this.texColor0 = null; this.texDisp0 = null;
+    this.texColor1 = null; this.texDisp1 = null;
+    this.layers = null;
     this.fbo = null; this.fboColor = null; this.fboDepthT = null;
     this.fboW = 0; this.fboH = 0;
   }
 
-  _makeDataTexture(internal, format, type, w, h, data) {
+  _colorTexture(w, h, rgba) {
     const gl = this.gl;
     const tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texStorage2D(gl.TEXTURE_2D, 1, internal, w, h);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, format, type, data);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, w, h);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE,
+      rgba instanceof Uint8Array ? rgba : new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength));
     return tex;
   }
 
-  /** cloud: {count, positions f32x3, cov f32x6, colors u8x4} */
-  setCloud(cloud) {
+  _dispTexture(w, h, f32) {
+    // R16F + LINEAR: half-float filtering is core WebGL2 everywhere
     const gl = this.gl;
-    // a 'built' can land while the context is lost (widened by the two-phase
-    // build) — no-op is correct: onContextRestored re-uploads app.cloud
-    if (this.contextLost || gl.isContextLost()) return;
-    for (const t of [this.texPos, this.texCovA, this.texCovB, this.texColor]) {
-      if (t) gl.deleteTexture(t);
-    }
-    const n = cloud.count;
-    this.count = n;
-    const texH = Math.max(1, Math.ceil(n / TEX_WIDTH));
-    if (texH > gl.getParameter(gl.MAX_TEXTURE_SIZE)) throw new Error('too many splats');
-    const texels = TEX_WIDTH * texH;
-
-    const pos = new Float32Array(texels * 4);
-    const covA = new Float32Array(texels * 4);
-    const covB = new Float32Array(texels * 2);
-    const col = new Uint8Array(texels * 4);
-    for (let i = 0; i < n; i++) {
-      pos[i * 4] = cloud.positions[i * 3];
-      pos[i * 4 + 1] = cloud.positions[i * 3 + 1];
-      pos[i * 4 + 2] = cloud.positions[i * 3 + 2];
-      covA[i * 4] = cloud.cov[i * 6];
-      covA[i * 4 + 1] = cloud.cov[i * 6 + 1];
-      covA[i * 4 + 2] = cloud.cov[i * 6 + 2];
-      covA[i * 4 + 3] = cloud.cov[i * 6 + 3];
-      covB[i * 2] = cloud.cov[i * 6 + 4];
-      covB[i * 2 + 1] = cloud.cov[i * 6 + 5];
-    }
-    col.set(cloud.colors.subarray(0, n * 4));
-
-    this.texPos = this._makeDataTexture(gl.RGBA32F, gl.RGBA, gl.FLOAT, TEX_WIDTH, texH, pos);
-    this.texCovA = this._makeDataTexture(gl.RGBA32F, gl.RGBA, gl.FLOAT, TEX_WIDTH, texH, covA);
-    this.texCovB = this._makeDataTexture(gl.RG32F, gl.RG, gl.FLOAT, TEX_WIDTH, texH, covB);
-    this.texColor = this._makeDataTexture(gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, TEX_WIDTH, texH, col);
-
-    // identity order until first sort arrives
-    const idx = new Uint32Array(n);
-    for (let i = 0; i < n; i++) idx[i] = i;
-    this.setSortedIndices(idx);
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R16F, w, h);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RED, gl.HALF_FLOAT, toHalfFloat(f32));
+    return tex;
   }
 
-  setSortedIndices(indices) {
+  /**
+   * layers: {color0, disp0, color1, disp1, pw, ph, pdw, pdh, w, h, padPx, padD}
+   * (w, h = interior image dims; pads relate texture->interior mapping)
+   */
+  setLayers(layers) {
     const gl = this.gl;
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.indexBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, indices, gl.DYNAMIC_DRAW);
-    this.instanceCount = indices.length;
+    if (this.contextLost || gl.isContextLost()) { this.layers = layers; return; }
+    for (const t of [this.texColor0, this.texDisp0, this.texColor1, this.texDisp1]) {
+      if (t) gl.deleteTexture(t);
+    }
+    this.layers = layers;
+    this.texColor0 = this._colorTexture(layers.pw, layers.ph, layers.color0);
+    this.texColor1 = this._colorTexture(layers.pw, layers.ph, layers.color1);
+    this.texDisp0 = this._dispTexture(layers.pdw, layers.pdh, layers.disp0);
+    this.texDisp1 = this._dispTexture(layers.pdw, layers.pdh, layers.disp1);
   }
 
   _ensureFbo(w, h) {
@@ -196,10 +169,9 @@ export class SplatRenderer {
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, this.fboDepthT, 0);
     const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
     if (status !== gl.FRAMEBUFFER_COMPLETE) {
-      // last-resort fallback to encoded RGBA8 targets
       if (this.rtFormat !== gl.RGBA8) {
         this.rtFormat = gl.RGBA8; this.rtType = gl.UNSIGNED_BYTE; this.depthEncoded = true;
-        this.fboW = 0; // force realloc
+        this.fboW = 0;
         this._ensureFbo(w, h);
         return;
       }
@@ -216,53 +188,69 @@ export class SplatRenderer {
   }
 
   /**
-   * state: {view, proj, bgTop, bgBottom, focusDist, dofStrength, maxCoC, splatScale}
-   * Renders to targetFbo (null = canvas) at (w, h).
+   * state: {eye:[ex,ey,ez], dConv, dSub, dMin, dMax, dFloor, fPx, steps,
+   *         bgTop, bgBottom, focusDist, dofStrength, maxCoC}
    */
   _renderInto(state, targetFbo, w, h) {
     const gl = this.gl;
+    const L = this.layers;
     this._ensureFbo(w, h);
 
-    // ---- pass 1: splats -> MRT ----
+    // contain-fit the image window in the viewport (bars show the bg gradient)
+    const imgAspect = L.w / L.h;
+    const vpAspect = w / h;
+    let fsx = 1, fsy = 1;
+    if (vpAspect > imgAspect) fsx = vpAspect / imgAspect;
+    else fsy = imgAspect / vpAspect;
+    const fox = (1 - fsx) / 2, foy = (1 - fsy) / 2;
+
+    // interior image uv -> padded texture uv
+    const csx = L.w / L.pw, csy = L.h / L.ph;
+    const cox = L.padPx / L.pw, coy = L.padPx / L.ph;
+
+    const [ex, ey, ez] = state.eye;
+    const dSub = state.dSub;
+
+    // ---- pass 1: raymarch -> MRT ----
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
     gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
     gl.viewport(0, 0, w, h);
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.CULL_FACE);
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.enable(gl.BLEND);
-    gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-
-    if (this.count > 0) {
-      gl.useProgram(this.progSplat);
-      gl.bindVertexArray(this.vao);
-      const texBind = (unit, tex, loc) => {
-        gl.activeTexture(gl.TEXTURE0 + unit);
-        gl.bindTexture(gl.TEXTURE_2D, tex);
-        gl.uniform1i(loc, unit);
-      };
-      texBind(0, this.texPos, this.uSplat.uTexPos);
-      texBind(1, this.texCovA, this.uSplat.uTexCovA);
-      texBind(2, this.texCovB, this.uSplat.uTexCovB);
-      texBind(3, this.texColor, this.uSplat.uTexColor);
-      gl.uniformMatrix4fv(this.uSplat.uView, false, state.view);
-      gl.uniformMatrix4fv(this.uSplat.uProj, false, state.proj);
-      const fx = state.proj[0] * w / 2;
-      const fy = state.proj[5] * h / 2;
-      gl.uniform2f(this.uSplat.uFocal, fx, fy);
-      gl.uniform2f(this.uSplat.uViewport, w, h);
-      gl.uniform1f(this.uSplat.uSplatScale, state.splatScale ?? 1);
-      gl.uniform1f(this.uSplat.uDepthEncode, this.depthEncoded ? 1 / DEPTH_RANGE_8BIT : 0);
-      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, Math.min(this.instanceCount, this.count));
-      gl.bindVertexArray(null);
-    }
+    gl.disable(gl.BLEND);
+    gl.useProgram(this.progMarch);
+    gl.bindVertexArray(this.vaoEmpty);
+    const bind = (unit, tex, loc) => {
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.uniform1i(loc, unit);
+    };
+    bind(0, this.texColor0, this.uMarch.uColor0);
+    bind(1, this.texDisp0, this.uMarch.uDisp0);
+    bind(2, this.texColor1, this.uMarch.uColor1);
+    bind(3, this.texDisp1, this.uMarch.uDisp1);
+    gl.uniform2f(this.uMarch.uCropScale, csx, csy);
+    gl.uniform2f(this.uMarch.uCropOff, cox, coy);
+    gl.uniform2f(this.uMarch.uFitScale, fsx, fsy);
+    gl.uniform2f(this.uMarch.uFitOff, fox, foy);
+    // image v grows DOWN while world y grows up: flip the y term
+    gl.uniform2f(this.uMarch.uKxy,
+      state.fPx * ex / (L.w * dSub),
+      -state.fPx * ey / (L.h * dSub));
+    gl.uniform1f(this.uMarch.uKz, -ez / dSub);
+    gl.uniform1f(this.uMarch.uDConv, state.dConv);
+    gl.uniform1f(this.uMarch.uDMin, state.dMin);
+    gl.uniform1f(this.uMarch.uDMax, state.dMax);
+    gl.uniform1f(this.uMarch.uDSub, dSub);
+    gl.uniform1f(this.uMarch.uDFloor, state.dFloor ?? 0.04);
+    gl.uniform1i(this.uMarch.uSteps, state.steps ?? 40);
+    gl.uniform1f(this.uMarch.uDepthEncode, this.depthEncoded ? 1 / DEPTH_RANGE_8BIT : 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     // ---- pass 2: composite + DoF ----
     gl.bindFramebuffer(gl.FRAMEBUFFER, targetFbo);
     if (targetFbo) gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
     gl.viewport(0, 0, w, h);
-    gl.disable(gl.BLEND);
     gl.useProgram(this.progComp);
     gl.bindVertexArray(this.vaoEmpty);
     gl.activeTexture(gl.TEXTURE0 + 4);
@@ -274,7 +262,7 @@ export class SplatRenderer {
     gl.uniform2f(this.uComp.uViewport, w, h);
     gl.uniform3fv(this.uComp.uBgTop, state.bgTop ?? [0.06, 0.07, 0.09]);
     gl.uniform3fv(this.uComp.uBgBottom, state.bgBottom ?? [0.02, 0.02, 0.03]);
-    gl.uniform1f(this.uComp.uFocusDist, state.focusDist ?? 2);
+    gl.uniform1f(this.uComp.uFocusDist, state.focusDist ?? 1);
     gl.uniform1f(this.uComp.uDofStrength, state.dofStrength ?? 0);
     gl.uniform1f(this.uComp.uMaxCoC, state.maxCoC ?? 22);
     gl.uniform1f(this.uComp.uDepthDecode, this.depthEncoded ? DEPTH_RANGE_8BIT : 0);
@@ -283,13 +271,13 @@ export class SplatRenderer {
   }
 
   render(state) {
-    if (this.contextLost) return;
+    if (this.contextLost || !this.layers) return;
     this._renderInto(state, null, this.canvas.width, this.canvas.height);
   }
 
-  /** Renders offscreen at up to `scale`x canvas size; returns {pixels, width, height} (top-down rows), or null if the GL context is lost. */
+  /** Offscreen render at up to `scale`x canvas size -> {pixels,width,height} (top-down), or null. */
   capture(state, scale = 2) {
-    if (this.contextLost) return null;
+    if (this.contextLost || !this.layers) return null;
     const gl = this.gl;
     const maxDim = 4096;
     let w = Math.round(this.canvas.width * scale);
@@ -307,7 +295,6 @@ export class SplatRenderer {
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
 
     const keepW = this.fboW, keepH = this.fboH;
-    // CoC is computed in render-target pixels: scale DoF to capture resolution
     const eff = w / this.canvas.width;
     const st = ((state.dofStrength ?? 0) > 0 && eff !== 1)
       ? { ...state, dofStrength: state.dofStrength * eff, maxCoC: (state.maxCoC ?? 22) * eff }
@@ -321,7 +308,6 @@ export class SplatRenderer {
     gl.deleteFramebuffer(fbo);
     gl.deleteTexture(tex);
 
-    // restore FBO size for interactive rendering
     if (keepW && (keepW !== this.fboW || keepH !== this.fboH)) this._ensureFbo(keepW, keepH);
 
     // flip vertically (GL reads bottom-up)
@@ -338,7 +324,8 @@ export class SplatRenderer {
 
   dispose() {
     const gl = this.gl;
-    for (const t of [this.texPos, this.texCovA, this.texCovB, this.texColor, this.fboColor, this.fboDepthT]) {
+    for (const t of [this.texColor0, this.texDisp0, this.texColor1, this.texDisp1,
+      this.fboColor, this.fboDepthT]) {
       if (t) gl.deleteTexture(t);
     }
     if (this.fbo) gl.deleteFramebuffer(this.fbo);

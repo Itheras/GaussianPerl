@@ -186,3 +186,50 @@ export function luma(rgba, i) {
   const o = i * 4;
   return 0.299 * rgba[o] + 0.587 * rgba[o + 1] + 0.114 * rgba[o + 2];
 }
+
+// Float32Array -> IEEE 754 half floats (Uint16Array). Disparity lives in
+// [0,1] where half precision (~1e-3 relative) is ample; R16F textures filter
+// LINEARly in core WebGL2 on every platform (float32 linear needs an ext).
+export function toHalfFloat(src) {
+  const out = new Uint16Array(src.length);
+  const f32 = new Float32Array(1);
+  const u32 = new Uint32Array(f32.buffer);
+  for (let i = 0; i < src.length; i++) {
+    f32[0] = src[i];
+    const x = u32[0];
+    const sign = (x >>> 16) & 0x8000;
+    let exp = (x >>> 23) & 0xff;
+    let mant = x & 0x7fffff;
+    if (exp === 255) { out[i] = sign | 0x7c00 | (mant ? 1 : 0); continue; } // inf/nan
+    let e = exp - 127 + 15;
+    if (e >= 31) { out[i] = sign | 0x7c00; continue; }        // overflow -> inf
+    if (e <= 0) {
+      if (e < -10) { out[i] = sign; continue; }               // underflow -> 0
+      mant = (mant | 0x800000) >> (1 - e);
+      out[i] = sign | (mant >> 13);
+      continue;
+    }
+    out[i] = sign | (e << 10) | (mant >> 13);
+  }
+  return out;
+}
+
+// 3x3 min-filter, iterated — erodes NEAR (large) disparity values so fg
+// silhouettes shrink a hair and the photo's mixed-color rim lands on the
+// background side (Immersity's edge-alignment trick).
+export function erodeMaxima(field, w, h, iterations = 2) {
+  let cur = Float32Array.from(field);
+  for (let it = 0; it < iterations; it++) {
+    const out = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const ym = Math.max(y - 1, 0) * w, yp = Math.min(y + 1, h - 1) * w, row = y * w;
+      for (let x = 0; x < w; x++) {
+        const xm = Math.max(x - 1, 0), xp = Math.min(x + 1, w - 1);
+        out[row + x] = Math.min(
+          cur[row + x], cur[row + xm], cur[row + xp], cur[ym + x], cur[yp + x]);
+      }
+    }
+    cur = out;
+  }
+  return cur;
+}
