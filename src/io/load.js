@@ -3,6 +3,7 @@
 
 import { resizeFloat } from '../util/imageops.js';
 import { decodeGtDisparity } from '../pipeline/depthproc.js';
+import { isSafariEngine } from '../config.js';
 
 export function workingSize(natW, natH, maxPixels) {
   const scale = Math.min(1, Math.sqrt(maxPixels / (natW * natH)));
@@ -12,11 +13,16 @@ export function workingSize(natW, natH, maxPixels) {
 }
 
 async function decodeToSource(blob) {
-  // <img> first: Safari's createImageBitmap(blob) IGNORES EXIF orientation
-  // (WebKit bug 237895) and succeeds anyway, so a try/catch can't save us —
-  // iPhone portrait photos would build sideways splats. The <img> path applies
-  // orientation correctly in every engine, and we rasterize to 2D right after,
-  // so ImageBitmap had no advantage here.
+  // Chromium/Firefox: createImageBitmap decodes off-thread, honors EXIF
+  // (imageOrientation 'from-image'), and — unlike <img>.decode() — is not
+  // starved in hidden/backgrounded tabs (a 12MP photo can hang for minutes
+  // there). Safari's createImageBitmap IGNORES EXIF (WebKit bug 237895) and
+  // succeeds anyway, so WebKit keeps the <img> path, which orients correctly.
+  if (!isSafariEngine() && typeof createImageBitmap === 'function') {
+    try {
+      return await createImageBitmap(blob, { imageOrientation: 'from-image' });
+    } catch { /* exotic format — fall through to <img> */ }
+  }
   const url = URL.createObjectURL(blob);
   try {
     const img = new Image();

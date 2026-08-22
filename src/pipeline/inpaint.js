@@ -23,7 +23,10 @@ export function synthesizeBackground(rgba, disp, w, h, fgB, opts = {}) {
   const bgColor = new Uint8ClampedArray(w * h * 4);
   const bgDisp = new Float32Array(w * h);
   const bgMask = new Uint8Array(w * h);
-  const maxMarch = bandPx * 2 + 6;
+  // a band pixel at distance d <= bandPx from the silhouette needs a march of
+  // ~d to cross it plus a few px of clean background — bandPx*2 was pure waste
+  // and the march dominates the classical stage at high resolutions
+  const maxMarch = bandPx + 16;
 
   const hitD = new Float32Array(8);
   const hitJ = new Int32Array(8);
@@ -93,9 +96,61 @@ export function synthesizeBackground(rgba, disp, w, h, fgB, opts = {}) {
     }
   }
 
+  // the 8-direction march fails on cluttered backgrounds (a crowd at noisy
+  // depths defeats the crossed-edge test) leaving COVERAGE HOLES inside the
+  // fill region — revealed as literal void at sharp angles. Close them by
+  // flooding from successfully filled neighbors.
+  closeBandHoles({ bgColor, bgDisp, bgMask }, disp, band, w, h, jump, bandPx);
+
   smoothWithinMask(bgColor, bgDisp, bgMask, w, h, jump);
   addGrain(bgColor, bgMask, w, h);
   return { bgColor, bgDisp, bgMask };
+}
+
+/**
+ * BFS from every filled bg pixel into band pixels the march failed on: a
+ * pixel joins when it sits genuinely IN FRONT of the neighbor's fill surface
+ * (disp > fill disp + jump — i.e. a real disocclusion the march missed).
+ * First-come = nearest donor; inherits its color and disparity. Exported for
+ * tests.
+ */
+export function closeBandHoles(bg, disp, band, w, h, jump, maxSteps) {
+  const { bgColor, bgDisp, bgMask } = bg;
+  const n = w * h;
+  const dist = new Int16Array(n).fill(-1);
+  let queue = new Int32Array(Math.max(256, n >> 3));
+  let qHead = 0, qTail = 0;
+  const push = (i) => {
+    if (qTail === queue.length) {
+      const bigger = new Int32Array(queue.length * 2);
+      bigger.set(queue);
+      queue = bigger;
+    }
+    queue[qTail++] = i;
+  };
+  for (let i = 0; i < n; i++) if (bgMask[i]) { dist[i] = 0; push(i); }
+  while (qHead < qTail) {
+    const i = queue[qHead++];
+    const d = dist[i];
+    if (d >= maxSteps) continue;
+    const x = i % w, y = (i / w) | 0;
+    for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1,
+      y > 0 ? i - w : -1, y < h - 1 ? i + w : -1]) {
+      if (j < 0 || dist[j] >= 0 || !band[j]) continue;
+      // only a genuine disocclusion: the pixel is clearly nearer than the
+      // fill surface it would sit in front of (a different donor with a
+      // farther surface may still claim it later — don't mark rejections)
+      if (disp[j] - bgDisp[i] <= jump) continue;
+      dist[j] = d + 1;
+      bgMask[j] = 1;
+      bgDisp[j] = Math.min(bgDisp[i], disp[j] - jump);
+      bgColor[j * 4] = bgColor[i * 4];
+      bgColor[j * 4 + 1] = bgColor[i * 4 + 1];
+      bgColor[j * 4 + 2] = bgColor[i * 4 + 2];
+      bgColor[j * 4 + 3] = 255;
+      push(j);
+    }
+  }
 }
 
 // 3x3 blur of color and disparity restricted to the synthesized mask —
@@ -126,6 +181,33 @@ function smoothWithinMask(bgColor, bgDisp, bgMask, w, h, jump) {
       }
     }
   }
+}
+
+/**
+ * Nearest-upsample a half-res background synthesis to full res (2x block
+ * copy). Masks stay crisp and the fields are smooth, so nearest is right —
+ * bilinear would bleed zeros across the mask boundary. The AI fill repaints
+ * colors at full res afterwards; only classical-kept slivers stay 2x blocky.
+ */
+export function upsampleBackground(bgH, hw, hh, w, h) {
+  const bgColor = new Uint8ClampedArray(w * h * 4);
+  const bgDisp = new Float32Array(w * h);
+  const bgMask = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const sy = Math.min(y >> 1, hh - 1);
+    for (let x = 0; x < w; x++) {
+      const sx = Math.min(x >> 1, hw - 1);
+      const si = sy * hw + sx, di = y * w + x;
+      if (!bgH.bgMask[si]) continue;
+      bgMask[di] = 1;
+      bgDisp[di] = bgH.bgDisp[si];
+      bgColor[di * 4] = bgH.bgColor[si * 4];
+      bgColor[di * 4 + 1] = bgH.bgColor[si * 4 + 1];
+      bgColor[di * 4 + 2] = bgH.bgColor[si * 4 + 2];
+      bgColor[di * 4 + 3] = 255;
+    }
+  }
+  return { bgColor, bgDisp, bgMask };
 }
 
 // subtle deterministic grain so the fill doesn't read as an airbrushed smear

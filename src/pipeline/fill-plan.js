@@ -63,9 +63,9 @@ export function buildFillInput(rgba, disp, bg, fgB, w, h, opts = {}) {
   const jump = opts.jump ?? 0.055;
   // wide enough that the occluder sits outside the model's near context at the
   // graph's 512-crop scale (Shih dilates 5px at 960; GAN receptive fields want
-  // more), narrow enough not to balloon the hole bbox
+  // more), narrow enough not to balloon the hole bbox — 2% of the short side
   const collarPx = opts.collarPx
-    ?? Math.max(6, Math.min(24, Math.round(Math.min(w, h) * 0.02)));
+    ?? Math.max(6, Math.min(48, Math.round(Math.min(w, h) * 0.02)));
   const collar = collarGrow(disp, fgB, w, h, collarPx, jump * 0.75);
   const rim = dilateMask(fgB, w, h, 2);
   const n = w * h;

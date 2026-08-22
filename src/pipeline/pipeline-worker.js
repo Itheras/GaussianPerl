@@ -13,9 +13,10 @@
 
 import {
   normalizeDisparity, heuristicDisparity, refineDisparity, edgeMask, fgBoundary,
-  snapDepthEdges, compressFarField,
+  snapDepthEdges, alignEdgesToColor, compressFarField,
 } from './depthproc.js';
-import { synthesizeBackground, addGrain } from './inpaint.js';
+import { synthesizeBackground, upsampleBackground, addGrain } from './inpaint.js';
+import { resizeFloat, resizeRGBA } from '../util/imageops.js';
 import {
   buildFillInput, padFloat, anchorToReference, smoothRingDisparity,
 } from './fill-plan.js';
@@ -124,8 +125,18 @@ async function build(msg, gen) {
     // real far fields barely parallax — flatten the tail before edge
     // detection so the horizon is a backdrop, not a giant silhouette
     disp = compressFarField(disp, params.farKnee ?? 0.08, params.farKeep ?? 0.35);
-    // consolidate soft silhouette ramps into clean steps before edge detection
-    disp = snapDepthEdges(disp, w, h, jump, 2);
+    // consolidate soft silhouette ramps into clean steps before edge
+    // detection — iterations scale with the model->working upsample ratio
+    // (each pass moves the ramp ~1px)
+    const snapIters = Math.max(2, Math.min(5, Math.round(Math.min(w, h) / 500)));
+    disp = snapDepthEdges(disp, w, h, jump, snapIters);
+    if (depthMeta.depthKind === 'ai') {
+      // the model saw the photo at ~518px: its silhouettes can sit several px
+      // off the color edge, stranding body-colored splats at background depth
+      // (dark streak sheets under yaw) — pull depth edges onto color edges
+      const alignR = Math.max(3, Math.min(6, Math.round(Math.min(w, h) / 400)));
+      disp = alignEdgesToColor(disp, rgba, w, h, jump, alignR);
+    }
     edges = edgeMask(disp, w, h, jump);
     stageCache = {
       sourceId: msg.sourceId, w, h, disp, edges,
@@ -133,9 +144,10 @@ async function build(msg, gen) {
     };
   }
 
-  // skirt width scales with resolution (fixed px would vanish at high res)
+  // skirt width scales with resolution (an absolute cap would starve high
+  // working resolutions down to a sliver — 88px is 5% at 'ultra')
   const skirtPx = params.withSkirt
-    ? (params.skirtPx || Math.max(16, Math.min(88, Math.round(Math.min(w, h) * 0.1))))
+    ? (params.skirtPx || Math.max(16, Math.min(192, Math.round(Math.min(w, h) * 0.1))))
     : 0;
 
   // ---------- classical background synthesis ----------
@@ -146,10 +158,26 @@ async function build(msg, gen) {
     } else {
       post('inpaint', 0.4);
       const fgB = fgBoundary(disp, w, h, jump);
-      // band scales with resolution: parallax reveals ~11% of the short side
+      // band scales with resolution: parallax reveals ~11% of the short side.
+      // The reveal is PROPORTIONAL — an absolute cap starves 'ultra' builds
+      // and the reveal runs past the band into visible void at sharp angles.
       const bandPx = params.bgBandPx
-        || Math.max(12, Math.min(72, Math.round(Math.min(w, h) * 0.11)));
-      bg = synthesizeBackground(rgba, disp, w, h, fgB, { bandPx, jump });
+        || Math.max(12, Math.round(Math.min(w, h) * 0.11));
+      if (w * h > 2_400_000) {
+        // the classical march is O(bandArea x band): at 'ultra' run it at
+        // half res (its outputs are a mask + smooth fields; the AI repaints
+        // the colors at full res anyway) and block-upsample
+        const hw = (w + 1) >> 1, hh = (h + 1) >> 1;
+        const rgbaH = resizeRGBA(rgba, w, h, hw, hh);
+        // resampling softens the snapped steps — re-snap at half res
+        const dispH = snapDepthEdges(resizeFloat(disp, w, h, hw, hh), hw, hh, jump, 2);
+        const fgBH = fgBoundary(dispH, hw, hh, jump);
+        const bgH = synthesizeBackground(rgbaH, dispH, hw, hh, fgBH,
+          { bandPx: bandPx >> 1, jump });
+        bg = upsampleBackground(bgH, hw, hh, w, h);
+      } else {
+        bg = synthesizeBackground(rgba, disp, w, h, fgB, { bandPx, jump });
+      }
       bg.fgB = fgB;
       if (stageCache) stageCache.bg = bg;
     }
@@ -248,7 +276,7 @@ async function build(msg, gen) {
       : { holes: new Uint8Array(w * h), prefilled: rgba }; // ring-only outpaint
     const budget = params.deviceClass === 'mobile'
       ? { interior: { maxBoxPx: 768, maxCalls: 4 }, ring: { maxBoxPx: 1024, maxCalls: 4 } }
-      : { interior: { maxBoxPx: 512, maxCalls: 6 }, ring: { maxBoxPx: 768, maxCalls: 6 } };
+      : { interior: { maxBoxPx: 512, maxCalls: 10 }, ring: { maxBoxPx: 768, maxCalls: 8 } };
     const { filled, genMask, plate, plateInit, ring } = await inpainter.fill({
       rgba: prefilled, holes, w, h,
       padPx: skirtPx,
@@ -261,7 +289,7 @@ async function build(msg, gen) {
     });
     const pw = w + 2 * skirtPx, ph = h + 2 * skirtPx;
 
-    const anchorR = Math.max(8, Math.min(20, Math.round(Math.min(w, h) * 0.015)));
+    const anchorR = Math.max(8, Math.min(32, Math.round(Math.min(w, h) * 0.015)));
     let bgColor = null;
     if (bg) {
       // anchor the fill's low frequencies to the classical estimate — GAN

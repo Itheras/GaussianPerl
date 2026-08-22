@@ -20,7 +20,10 @@ export function isSafariEngine() {
 
 export function defaultQuality() {
   if (isMobile()) return 'medium';
-  return 'high';
+  // modern desktop GPUs handle ~5M splats; webgpu presence is the proxy.
+  // 4.2MP working res is display-limited on a 2x canvas — going higher only
+  // burns memory without visible sharpness.
+  return navigator.gpu ? 'ultra' : 'high';
 }
 
 // maxPixels: budget for the fine splat layer (≈ splat count before extras)
@@ -28,6 +31,7 @@ export const QUALITY = {
   low: { maxPixels: 380_000 },
   medium: { maxPixels: 730_000 },
   high: { maxPixels: 1_400_000 },
+  ultra: { maxPixels: 4_200_000 },
 };
 
 export const DEFAULTS = {

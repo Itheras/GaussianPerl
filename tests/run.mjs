@@ -8,9 +8,9 @@ import {
 } from '../src/util/imageops.js';
 import {
   normalizeDisparity, decodeGtDisparity, heuristicDisparity, disparityToDepth,
-  edgeMask, fgBoundary, snapDepthEdges, compressFarField,
+  edgeMask, fgBoundary, snapDepthEdges, alignEdgesToColor, compressFarField,
 } from '../src/pipeline/depthproc.js';
-import { synthesizeBackground } from '../src/pipeline/inpaint.js';
+import { synthesizeBackground, upsampleBackground, closeBandHoles } from '../src/pipeline/inpaint.js';
 import {
   collarGrow, buildFillInput, planClusters, padPlate, padFloat, ringMask,
   packImageNCHW, packMaskForBox, unpackNCHW, anchorToReference, smoothRingDisparity,
@@ -215,6 +215,35 @@ await test('snapDepthEdges: soft silhouette ramp becomes a step, gradients survi
   for (let i = 0; i < g.length; i++) near(g2[i], g[i], 1e-6);
 });
 
+await test('alignEdgesToColor pulls a shifted depth edge onto the color edge', () => {
+  const w = 24, h = 8;
+  const rgba = new Uint8ClampedArray(w * h * 4);
+  const disp = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      // color boundary at x=10 (fg red, bg blue)…
+      const fg = x < 10;
+      rgba[i * 4] = fg ? 200 : 20;
+      rgba[i * 4 + 1] = 30;
+      rgba[i * 4 + 2] = fg ? 30 : 200;
+      rgba[i * 4 + 3] = 255;
+      // …but the model's (snapped) depth step sits at x=13
+      disp[i] = x < 13 ? 0.8 : 0.2;
+    }
+  }
+  const out = alignEdgesToColor(disp, rgba, w, h, 0.055, 4);
+  // bg-colored pixels stranded at fg depth (x=10..12) move to bg depth
+  for (const x of [10, 11, 12]) {
+    const v = out[4 * w + x];
+    assert.ok(Math.abs(v - 0.2) < 0.05, `bg-colored x=${x} pulled to bg depth (got ${v})`);
+  }
+  // true fg keeps its depth; far-from-edge pixels untouched
+  assert.ok(Math.abs(out[4 * w + 8] - 0.8) < 0.05, 'fg interior stays near');
+  near(out[4 * w + 20], 0.2, 1e-6);
+  near(out[4 * w + 1], 0.8, 1e-6);
+});
+
 await test('compressFarField: flattens far tail, keeps near field, stays monotone', () => {
   const d = new Float32Array([0, 0.02, 0.06, 0.08, 0.3, 1]);
   const c = compressFarField(d, 0.08, 0.35);
@@ -268,6 +297,55 @@ await test('synthesizeBackground fills behind a foreground square', () => {
     }
   }
   assert.ok(inside > 20, `expected fill inside fg, got ${inside}`);
+});
+
+await test('closeBandHoles floods failed band pixels from filled neighbors', () => {
+  const w = 20, h = 8;
+  const disp = new Float32Array(w * h).fill(0.9); // foreground everywhere
+  const band = new Uint8Array(w * h).fill(1);
+  const bgColor = new Uint8ClampedArray(w * h * 4);
+  const bgDisp = new Float32Array(w * h);
+  const bgMask = new Uint8Array(w * h);
+  // left column filled at bg depth 0.2; rest of the band is a failed hole
+  for (let y = 0; y < h; y++) {
+    const i = y * w;
+    bgMask[i] = 1; bgDisp[i] = 0.2;
+    bgColor[i * 4] = 10; bgColor[i * 4 + 1] = 180; bgColor[i * 4 + 2] = 20; bgColor[i * 4 + 3] = 255;
+  }
+  closeBandHoles({ bgColor, bgDisp, bgMask }, disp, band, w, h, 0.1, 8);
+  assert.equal(bgMask[3 * w + 6], 1, 'hole 6px in closed');
+  assert.equal(bgColor[(3 * w + 6) * 4 + 1], 180, 'donor color inherited');
+  assert.ok(bgDisp[3 * w + 6] <= 0.8, 'fill stays behind the foreground');
+  assert.equal(bgMask[3 * w + 12], 0, 'maxSteps respected');
+  // a band pixel already AT background depth is not a disocclusion — untouched
+  const disp2 = new Float32Array(w * h).fill(0.22);
+  const bgMask2 = new Uint8Array(w * h);
+  bgMask2[0] = 1;
+  const bgDisp2 = new Float32Array(w * h); bgDisp2[0] = 0.2;
+  closeBandHoles({ bgColor: new Uint8ClampedArray(w * h * 4), bgDisp: bgDisp2, bgMask: bgMask2 },
+    disp2, band, w, h, 0.1, 8);
+  assert.equal(bgMask2[1], 0, 'background-depth pixel not claimed');
+});
+
+await test('upsampleBackground: 2x block copy, crisp mask, odd sizes', () => {
+  const hw = 3, hh = 2;
+  const bgH = {
+    bgMask: Uint8Array.from([0, 1, 0, 1, 0, 1]),
+    bgDisp: Float32Array.from([0, 0.5, 0, 0.7, 0, 0.9]),
+    bgColor: new Uint8ClampedArray(hw * hh * 4),
+  };
+  bgH.bgColor[1 * 4] = 111; bgH.bgColor[3 * 4] = 133; bgH.bgColor[5 * 4] = 155;
+  const w = 5, h = 4; // odd width: last column maps to hw-1
+  const up = upsampleBackground(bgH, hw, hh, w, h);
+  assert.equal(up.bgMask[0 * w + 2], 1, '(2,0) -> src(1,0) masked');
+  near(up.bgDisp[0 * w + 3], 0.5, 1e-6); // (3,0) -> src(1,0)
+  assert.equal(up.bgColor[(0 * w + 2) * 4], 111);
+  assert.equal(up.bgMask[2 * w + 0], 1, '(0,2) -> src(0,1) masked');
+  near(up.bgDisp[2 * w + 0], 0.7, 1e-6);
+  assert.equal(up.bgColor[(2 * w + 0) * 4], 133);
+  assert.equal(up.bgMask[0 * w + 0], 0, 'unmasked stays unmasked');
+  assert.equal(up.bgMask[3 * w + 4], 1, 'odd edge clamps to last src col');
+  near(up.bgDisp[3 * w + 4], 0.9, 1e-6);
 });
 
 // ---------------- fill-plan ----------------

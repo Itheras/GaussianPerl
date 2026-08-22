@@ -25,7 +25,7 @@ const settings = {
   quality: urlParams.get('quality') || defaultQuality(),
   depthStrength: 1,
   splatScale: 1,
-  aperture: 0.25,
+  aperture: 0, // sharp by default — the photo had no synthetic DoF either
   fovYDeg: DEFAULTS.fovYDeg,
   wiggle: !urlParams.has('nowiggle'),
   withBg: true,
