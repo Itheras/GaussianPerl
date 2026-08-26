@@ -23,9 +23,11 @@ import {
 import { synthesizeBackground, addGrain } from './inpaint.js';
 import { buildFillInput, anchorToReference } from './fill-plan.js';
 import { buildLayers, upsampleBackgroundTo } from './layer-build.js';
-import { resizeFloat, resizeRGBA, percentile } from '../util/imageops.js';
+import { resizeFloat, resizeRGBA, percentile, estimateNoiseSigma } from '../util/imageops.js';
 import { DepthEstimator } from './depth-ai.js';
 import { Inpainter } from './inpaint-ai.js';
+import { expandView } from './expand.js';
+import { NativeInpainter } from '../backend/native-fill.js';
 
 const DEPTH_MAX_PIXELS = 1_750_000;
 
@@ -37,16 +39,86 @@ let buildGen = 0;
 let depthDlSink = null;
 let fillDlSink = null;
 
+let expandGen = 0;
+
+// The guesser. A local sidecar (4B diffusion prior) if one is reachable, else
+// the in-browser MI-GAN. Probed per call: the sidecar may start after the
+// page did, and a dead one must degrade instantly, not stall the build.
+async function chooseInpainter(params, onDownload) {
+  if (params.sidecar) {
+    const native = await NativeInpainter.probe(params.sidecar);
+    if (native) return native;
+  }
+  if (!params.aiFill) return null;
+  return Inpainter.load(onDownload, { forceWasm: params.forceWasmFill || params.webkitHint });
+}
+
 self.onmessage = (e) => {
   const msg = e.data;
-  if (msg.type !== 'build') return;
-  const gen = ++buildGen;
-  build(msg, gen).catch((err) => {
-    if (gen === buildGen) {
-      self.postMessage({ type: 'error', id: msg.id, message: String(err && err.stack || err) });
-    }
-  });
+  if (msg.type === 'build') {
+    const gen = ++buildGen;
+    expandGen++; // a rebuild invalidates every in-flight expansion
+    build(msg, gen).catch((err) => {
+      if (gen === buildGen) {
+        self.postMessage({ type: 'error', id: msg.id, message: String(err && err.stack || err) });
+      }
+    });
+    return;
+  }
+  if (msg.type === 'expand') {
+    const gen = ++expandGen;
+    const buildAt = buildGen;
+    expand(msg, gen, buildAt).catch((err) => {
+      if (err && err.name === 'AbortError') return;
+      if (gen === expandGen) {
+        self.postMessage({ type: 'expand-failed', id: msg.id, message: String(err && err.message || err) });
+      }
+    });
+  }
 };
+
+/**
+ * Grow the scene: a rendered novel view (colour + confidence + the depth the
+ * renderer already knew) becomes a fully generated anchor. Runs on the same
+ * two models the build uses, so the weights are already resident.
+ */
+async function expand(msg, gen, buildAt) {
+  const { id, w, h, params = {} } = msg;
+  const stale = () => gen !== expandGen || buildAt !== buildGen;
+  const post = (stage, extra) => self.postMessage({ type: 'expand-progress', id, stage, ...extra });
+
+  const inpainter = (params.aiFill || params.sidecar)
+    ? await chooseInpainter(params, () => post('fill-download'))
+    : null;
+  if (stale()) return;
+  const depth = params.wantAiDepth
+    ? await DepthEstimator.load(() => post('depth-download'), {
+      deviceClass: params.deviceClass, forceWasm: params.webkitHint,
+    })
+    : null;
+  if (stale()) return;
+
+  const out = await expandView({
+    rgba: new Uint8ClampedArray(msg.rgba),
+    conf: new Float32Array(msg.conf),
+    refDisp: new Float32Array(msg.refDisp),
+    w, h, params,
+  }, {
+    inpainter, depth,
+    fallback: params.aiFill
+      ? () => Inpainter.load(() => post('fill-download'), { forceWasm: params.forceWasmFill || params.webkitHint })
+      : null,
+    onProgress: (pr) => { if (!stale()) post(pr.stage, pr); },
+    shouldAbort: stale,
+  });
+
+  if (stale()) return;
+  if (!out) { self.postMessage({ type: 'expand-skipped', id }); return; }
+  self.postMessage({
+    type: 'expanded', id, anchorId: msg.anchorId,
+    color: out.color, disp: out.disp, dw: out.dw, dh: out.dh, stats: out.stats,
+  }, [out.color.buffer, out.disp.buffer]);
+}
 
 function depthDims(w, h) {
   // never upscale, never distort aspect (a per-axis floor would)
@@ -66,16 +138,34 @@ function upsampleMask(m, dw, dh, w, h) {
   return out;
 }
 
-// center-weighted median disparity: the subject anchor (d_s). Uses the middle
-// half of the frame, which is where photo subjects live.
-function subjectDisparity(disp, w, h) {
+// The subject anchor d_s: Z_subject = 1 is the ORBIT PIVOT, so this decides
+// what the camera moves around. The centre-box median is wrong whenever the
+// subject is off-centre: on a photo of two people standing at the right edge
+// in front of a wave pool it picked the WATER (0.14), leaving the couple seven
+// times nearer than the pivot — a 5-degree orbit swept them 64% of the frame
+// and clean off screen, which looked exactly like "the fill destroyed the
+// people". People in photos are the NEAR thing: take the nearest 15% of the
+// frame (floor band at the camera's feet excluded) and pivot on its median
+// when it stands well in front of the frame's typical depth; else the old rule.
+export function subjectDisparity(disp, w, h) {
+  const yFloor = Math.round(h * 0.92);
+  const all = new Float32Array(w * yFloor);
+  let n = 0;
+  for (let y = 0; y < yFloor; y++) for (let x = 0; x < w; x++) all[n++] = disp[y * w + x];
+  // the near 15% of the frame: a person-sized subject is often well under a
+  // quarter of the pixels, and a looser cut lets the background vote
+  const p85 = percentile(all, 0.85);
+  const near = [];
+  for (let i = 0; i < n; i++) if (all[i] >= p85) near.push(all[i]);
+  const nearMed = percentile(Float32Array.from(near), 0.5);
   const x0 = w >> 2, x1 = w - (w >> 2), y0 = h >> 2, y1 = h - (h >> 2);
   const box = new Float32Array((x1 - x0) * (y1 - y0));
-  let n = 0;
-  for (let y = y0; y < y1; y++) {
-    for (let x = x0; x < x1; x++) box[n++] = disp[y * w + x];
-  }
-  return percentile(box, 0.5);
+  let m = 0;
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) box[m++] = disp[y * w + x];
+  const centre = percentile(box, 0.5);
+  // a real near subject stands well in front of the frame's typical depth;
+  // a flat scene (everything at one distance) keeps the centre rule
+  return nearMed > centre * 1.6 ? nearMed : centre;
 }
 
 async function build(msg, gen) {
@@ -110,6 +200,7 @@ async function build(msg, gen) {
       const est = await DepthEstimator.load((p) => depthDlSink && depthDlSink(p), {
         deviceClass: params.deviceClass,
         forceWasm: params.webkitHint,
+        hq: params.hq,
       });
       if (superseded()) return;
       if (est) {
@@ -179,6 +270,9 @@ async function build(msg, gen) {
   const dMin = Math.max(percentile(dispD, 0.01) - 0.02, 0);
   const dMax = Math.min(percentile(dispD, 0.995) + 0.02, 1.05);
 
+  // the photograph's own grain, so invented pixels can be given the same
+  const noiseSigma = estimateNoiseSigma(rgba, w, h);
+
   const bandRows = Math.max(1, Math.floor(dh * 0.15));
   const rowMean = (y0, y1) => {
     let s = 0, n = 0;
@@ -205,6 +299,7 @@ async function build(msg, gen) {
     });
     const meta = {
       ...depthMeta,
+      noiseSigma,
       w, h, padPx, dw, dh, padD,
       pw: layers.pw, ph: layers.ph, pdw: layers.pdw, pdh: layers.pdh,
       dSub, dMin, dMax, dFloor: 0.04,
@@ -224,7 +319,7 @@ async function build(msg, gen) {
   };
 
   // ---------- generative fill ----------
-  const wantFill = params.aiFill && (bgD || padPx > 0);
+  const wantFill = (params.aiFill || (!!params.sidecar && !!params.sidecarForBase)) && (bgD || padPx > 0);
   if (!wantFill) {
     finish('final', null);
     return;
@@ -251,9 +346,13 @@ async function build(msg, gen) {
   fillDlSink = (p) => {
     if (!superseded() && p.phase === 'download') post('fill-download', 0.8, { pct: p.pct });
   };
-  const inpainter = await Inpainter.load((p) => fillDlSink && fillDlSink(p), {
-    forceWasm: params.forceWasmFill || params.webkitHint,
-  });
+  // The base build's holes are thin silhouette bands + the outpaint ring:
+  // MI-GAN handles those in ~200 ms. The 4B prior costs ~50 s a call and is
+  // reserved for novel-view expansion, where a person's far side has to be
+  // INVENTED — unless explicitly asked for on the base too.
+  const inpainter = await chooseInpainter(
+    params.sidecarForBase ? params : { ...params, sidecar: null },
+    (p) => fillDlSink && fillDlSink(p));
   if (superseded()) return;
   if (!inpainter) {
     markFailed();
@@ -286,8 +385,10 @@ async function build(msg, gen) {
       budget,
       consumable: bgWMask,
       shouldAbort: () => gen !== buildGen,
-      onProgress: ({ done, total }) => {
-        if (!superseded()) post('fill', 0.8 + 0.15 * (done / total), { done, total });
+      onProgress: ({ phase, done, total }) => {
+        if (superseded()) return;
+        if (phase === 'wait') post('fill', 0.8, { waiting: true });
+        else post('fill', 0.8 + 0.15 * (done / total), { done, total });
       },
     });
 

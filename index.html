@@ -2,12 +2,12 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>GaussianPerl — single-photo gaussian splats</title>
+  <title>GaussianPerl — walk around a single photo</title>
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <meta name="theme-color" content="#0b0d12">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="description" content="Turn a single photo into an interactive 3D gaussian splat — on-device AI depth, orbit, refocus, save.">
+  <meta name="description" content="Turn a single photo into a 3D scene you can move through — on-device AI depth and generative fill, free camera, refocus, save.">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🫧</text></svg>">
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -20,21 +20,22 @@
       <div class="chip status" id="status" hidden></div>
     </div>
 
-    <div id="hint" hidden>drag to look around · pinch / scroll to zoom · double-tap to refocus</div>
+    <div id="hint" hidden>drag to orbit · shift-drag or two fingers to pan · scroll / pinch to dolly · W A S D to fly · double-tap to re-centre</div>
     <div id="focusRing" hidden></div>
 
     <div id="toolbar">
       <button id="btnOpen" title="Open a photo">📷 Open</button>
       <button id="btnSample" title="Load the bundled sample">✨ Sample</button>
-      <button id="btnReset" title="Reset the view">🎯 Reset</button>
+      <button id="btnReset" title="Back to the photo's own viewpoint">🎯 Reset</button>
+      <button id="btnFill" title="Generate the parts of this view the photo never saw">✨ Fill view</button>
       <button id="btnPanel" title="Settings">⚙️ Tune</button>
       <button id="btnSave" class="primary" title="Save what you see as a PNG">💾 Save PNG</button>
     </div>
 
     <div id="panel" hidden>
       <div class="row">
-        <label>3D boost</label>
-        <input type="range" id="sDepth" min="0.2" max="2.2" step="0.05" value="1">
+        <label>Speed</label>
+        <input type="range" id="sSpeed" min="0.25" max="3" step="0.05" value="1">
       </div>
       <div class="row">
         <label>Aperture</label>
@@ -54,10 +55,22 @@
         </select>
       </div>
       <div class="row toggles">
+        <label title="Generate missing data whenever the camera settles"><input type="checkbox" id="tAuto" checked> Auto-fill</label>
+        <label title="Remove the camera limits"><input type="checkbox" id="tRoam"> Free roam</label>
+        <label title="Drag rotates in place instead of orbiting"><input type="checkbox" id="tLook"> Look mode</label>
+      </div>
+      <div class="row toggles">
         <label><input type="checkbox" id="tBg" checked> Edge fill</label>
         <label><input type="checkbox" id="tAiFill" checked> AI fill</label>
         <label><input type="checkbox" id="tSkirt" checked> Skirt</label>
         <label><input type="checkbox" id="tWiggle" checked> Wiggle</label>
+      </div>
+      <div class="row">
+        <label>Background</label>
+        <input type="text" id="iPrompt" placeholder="describe the surroundings only — not the subject">
+      </div>
+      <div class="row">
+        <span id="anchorInfo" class="dim">no generated views yet</span>
       </div>
       <div class="row">
         <span id="modelInfo" class="dim"></span>
@@ -66,9 +79,10 @@
 
     <div id="welcome">
       <h1>🫧 GaussianPerl</h1>
-      <p>Turn one photo into a 3D gaussian splat — right on this device.</p>
-      <p class="dim">Local AI models estimate depth and dream up the areas the
-        camera never saw — you get a splat you can orbit, refocus and capture.</p>
+      <p>Turn one photo into a 3D scene you can walk around — right on this device.</p>
+      <p class="dim">Local AI models estimate depth, and as you move the camera
+        they paint in whatever the photo never saw — so you keep getting a
+        picture that looks like it was taken from there.</p>
       <div class="welcomeButtons">
         <button id="btnWelcomeOpen" class="primary">📷 Open a photo</button>
         <button id="btnWelcomeSample">✨ Try the sample</button>

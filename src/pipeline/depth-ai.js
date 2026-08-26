@@ -13,6 +13,7 @@
 // still works when the CDN/model is unreachable (caller falls back).
 
 import { MODEL, isSafariEngine } from '../config.js';
+import { hasWebGpuAdapter, webGpuInferenceBlocked } from '../backend/capabilities.js';
 import { resizeFloat } from '../util/imageops.js';
 
 let _instance = null;
@@ -74,11 +75,16 @@ export class DepthEstimator {
     // opts.forceWasm: main-thread WebKit hint (Chrome-on-iPadOS wears the
     // desktop-Mac UA; only maxTouchPoints on the main thread can tell).
     let hasGpu = false;
-    if (!opts.forceWasm && !isSafariEngine() && globalThis.navigator && navigator.gpu) {
-      try { hasGpu = !!(await navigator.gpu.requestAdapter()); } catch { hasGpu = false; }
+    if (!opts.forceWasm && !isSafariEngine() && !webGpuInferenceBlocked()) {
+      hasGpu = await hasWebGpuAdapter();
     }
     if (hasGpu && opts.deviceClass === 'desktop') {
-      attempts.push({ id: MODEL.idHQ, device: 'webgpu', dtype: 'q4f16', tier: 'base' });
+      // opts.hq: the user explicitly asked for the sharper NON-COMMERCIAL
+      // checkpoint (?hq=1). Never reached by default — see MODEL.idHQ.
+      if (opts.hq) {
+        attempts.push({ id: MODEL.idHQNonCommercial, device: 'webgpu', dtype: 'q4f16', tier: 'base-nc' });
+      }
+      attempts.push({ id: MODEL.idHQ, device: 'webgpu', dtype: 'fp16', tier: 'small-hq' });
     }
     if (hasGpu) {
       attempts.push({ id: MODEL.id, device: 'webgpu', dtype: 'fp16', tier: 'small' });

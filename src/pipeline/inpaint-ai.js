@@ -22,6 +22,7 @@
 // the classical fill path keeps working offline.
 
 import { FILL, isSafariEngine } from '../config.js';
+import { hasWebGpuAdapter, webGpuInferenceBlocked } from '../backend/capabilities.js';
 import {
   planClusters, packImageNCHW, packMaskForBox, unpackNCHW,
   padPlate, ringMask,
@@ -144,12 +145,11 @@ export class Inpainter {
     try {
       const bytes = await fetchModelBytes(
         (pct) => onProgress({ phase: 'download', pct }));
-      let wantGpu = !opts.forceWasm && !isSafariEngine() &&
-        !!(globalThis.navigator && navigator.gpu);
-      if (wantGpu) {
-        // navigator.gpu can exist with no usable adapter (headless, blocklists)
-        try { wantGpu = !!(await navigator.gpu.requestAdapter()); } catch { wantGpu = false; }
-      }
+      // NOTE: this is the third webgpu probe site and the one that gets
+      // missed — it picks the onnxruntime execution provider, not a
+      // transformers.js device. All three now go through one accessor.
+      let wantGpu = !opts.forceWasm && !isSafariEngine() && !webGpuInferenceBlocked();
+      if (wantGpu) wantGpu = await hasWebGpuAdapter();
       let ort = null, session = null, backend = 'wasm';
       if (wantGpu) {
         try {

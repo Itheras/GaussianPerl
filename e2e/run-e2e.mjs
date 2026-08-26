@@ -102,8 +102,13 @@ try {
   for (let i = 1; i <= 8; i++) await page.mouse.move(450 - i * 18, 320 + i * 6);
   await page.mouse.up();
   await page.waitForTimeout(400);
-  const ex = await page.evaluate(() => window.__gp.cam.ex);
-  check(Math.abs(ex) > 0.002, `drag translates the camera (ex ${ex.toFixed(4)})`);
+  const orb = await page.evaluate(() => ({
+    yaw: window.__gp.cam.yaw, pitch: window.__gp.cam.pitch,
+    C: Array.from(window.__gp.cam.center()),
+  }));
+  check(Math.abs(orb.yaw) > 0.01, `drag orbits the camera (yaw ${orb.yaw.toFixed(3)})`);
+  check(Math.hypot(orb.C[0], orb.C[1], orb.C[2]) > 0.02,
+    `orbiting actually moves the eye (|C| ${Math.hypot(orb.C[0], orb.C[1], orb.C[2]).toFixed(3)})`);
   const after = await page.evaluate(() => {
     const cap = window.__gp.captureNow(1);
     return Array.from(cap.pixels.filter((_, i) => i % 997 === 0));
@@ -112,12 +117,21 @@ try {
   for (let i = 0; i < before.length; i++) diff += Math.abs(before[i] - after[i]);
   check(diff / before.length > 0.5, `pixels changed after pan (avg diff ${(diff / before.length).toFixed(2)})`);
 
-  // wheel dollies (ez > 0)
+  // wheel dollies: the orbit radius shrinks
   await page.evaluate(() => window.__gp.cam.reset());
+  const dist0 = await page.evaluate(() => window.__gp.cam.dist);
   await page.mouse.wheel(0, -400);
   await page.waitForTimeout(120);
-  const ez = await page.evaluate(() => window.__gp.cam.ez);
-  check(ez > 0.005, `wheel dollies in (ez ${ez.toFixed(3)})`);
+  const dist1 = await page.evaluate(() => window.__gp.cam.dist);
+  check(dist1 < dist0 - 0.005, `wheel dollies in (${dist0.toFixed(3)} -> ${dist1.toFixed(3)})`);
+
+  // keyboard fly moves the eye
+  await page.evaluate(() => window.__gp.cam.reset());
+  await page.keyboard.down('a');
+  await page.waitForTimeout(350);
+  await page.keyboard.up('a');
+  const flew = await page.evaluate(() => Array.from(window.__gp.cam.center()));
+  check(flew[0] < -0.005, `A key flies left (x ${flew[0].toFixed(4)})`);
 
   // double-click re-pivots + refocuses: foreground stone vs sky
   await page.evaluate(() => window.__gp.cam.reset());
@@ -128,42 +142,149 @@ try {
   const focusFar = await page.evaluate(() => window.__gp.app.targetFocus);
   check(focusFar > focusNear * 1.2, `refocus near->far (${focusNear.toFixed(2)} -> ${focusFar.toFixed(2)})`);
 
-  // subject-plane lock: at the pivot plane, a full-envelope pan moves content <1.5px
-  const lock = await page.evaluate(async () => {
+  // Rest fidelity: at the home pose the render must BE the photograph. This is
+  // the invariant the whole free camera is built around — every anchor, every
+  // confidence term and the whole generation loop must leave it untouched.
+  const restStats = await page.evaluate(async () => {
     const gp = window.__gp;
     gp.cam.reset(); gp.settings.aperture = 0;
-    gp.app.dConv = gp.app.meta.dSub;
     gp.app.needsRender = true;
-    await new Promise((r) => setTimeout(r, 100));
-    const capA = gp.captureNow(1);
-    gp.cam.ex = gp.cam.exyMax; gp.app.needsRender = true;
-    await new Promise((r) => setTimeout(r, 100));
-    const capB = gp.captureNow(1);
-    // measure shift of the pivot-plane content: find disparity==dSub pixels is
-    // hard from pixels alone; instead assert the CENTER ROW cross-correlation
-    // peak is at a sub-2px shift (subject dominates the center)
-    const w = capA.width, h = capA.height;
-    const row = (cap, y) => {
-      const out = new Float32Array(w);
-      for (let x = 0; x < w; x++) {
-        const i = (y * w + x) * 4;
-        out[x] = (cap.pixels[i] + cap.pixels[i + 1] + cap.pixels[i + 2]) / 3;
-      }
-      return out;
-    };
-    const a = row(capA, Math.floor(h * 0.55)), b = row(capB, Math.floor(h * 0.55));
-    let bestShift = 0, bestScore = Infinity;
-    for (let s = -12; s <= 12; s++) {
-      let sc = 0, n = 0;
-      for (let x = Math.max(0, -s); x < Math.min(w, w - s); x += 2) {
-        sc += Math.abs(a[x] - b[x + s]); n++;
-      }
-      sc /= n;
-      if (sc < bestScore) { bestScore = sc; bestShift = s; }
+    await new Promise((r) => setTimeout(r, 120));
+    const st = gp.renderState();
+    const cap = gp.renderer.captureAnchorFrame({
+      ...st, cam: { R: st.cam.R, C: st.cam.C, K: st.cam.K },
+      trustBase: false, dofStrength: 0,
+    }, 160, 120);
+    let holes = 0, minConf = 1, minBase = 1;
+    for (let i = 0; i < cap.conf.length; i++) {
+      if (cap.conf[i] < 0.5) holes++;
+      if (cap.conf[i] < minConf) minConf = cap.conf[i];
+      if (cap.baseShare[i] < minBase) minBase = cap.baseShare[i];
     }
-    return bestShift;
+    return { holeFrac: holes / cap.conf.length, minConf, minBase };
   });
-  check(Math.abs(lock) <= 2, `pivot-plane content stays locked under full pan (shift ${lock}px)`);
+  check(restStats.holeFrac === 0,
+    `at rest nothing is missing (hole fraction ${restStats.holeFrac})`);
+  // confidence and provenance both saturated is what makes the screen-space
+  // grain weight exactly zero at home — i.e. the photograph is returned
+  // untouched, which is the property the whole design is built around
+  check(restStats.minConf > 0.99 && restStats.minBase > 0.99,
+    `at rest every pixel is pure photograph (conf ${restStats.minConf.toFixed(3)}, base ${restStats.minBase.toFixed(3)})`);
+
+  // THE GATE. At the home pose the render must be the photograph, byte for
+  // byte — not "close", not "no holes". Every later stage (native shell,
+  // semantic inpainting, reconstructed people) plugs into the same anchor
+  // loop, and each one is a chance to silently perturb this. Asserted here
+  // three times: fresh, after an anchor is committed, and after a GPU context
+  // loss, which is the path that would otherwise lose generated anchors and
+  // re-upload something subtly different.
+  const pixelExact = await page.evaluate(async () => {
+    const gp = window.__gp;
+    const m = gp.app.meta;
+    const src = gp.app.imageData.data;
+
+    const measure = () => {
+      gp.cam.reset();
+      gp.settings.aperture = 0;
+      const st = gp.renderState();
+      const cap = gp.renderer.captureAnchorFrame({
+        ...st, cam: { R: st.cam.R, C: st.cam.C, K: st.cam.K },
+        trustBase: false, dofStrength: 0,
+      }, m.w, m.h);
+      let maxDelta = 0, holes = 0;
+      for (let i = 0; i < m.w * m.h; i++) {
+        if (cap.conf[i] < 0.5) holes++;
+        for (let c = 0; c < 3; c++) {
+          const d = Math.abs(cap.rgba[i * 4 + c] - src[i * 4 + c]);
+          if (d > maxDelta) maxDelta = d;
+        }
+      }
+      return { maxDelta, holeFrac: holes / (m.w * m.h) };
+    };
+
+    const fresh = measure();
+
+    // ...still exact once a generated anchor exists in the scene
+    gp.cam.yaw = 0.16; gp.cam._clamp();
+    gp.app.needsRender = true;
+    gp.requestExpand(true);
+    for (let i = 0; i < 200 && gp.app.expandInFlight; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    gp.renderer.anchors.forEach((a) => { a.weight = 1; });
+    const anchors = gp.app.anchors.length;
+    const withAnchor = measure();
+
+    // ...and still exact after the GPU drops the context out from under us
+    let restored = false;
+    const ext = gp.renderer.gl.getExtension('WEBGL_lose_context');
+    if (ext) {
+      const done = new Promise((r) => {
+        gp.renderer.canvas.addEventListener('webglcontextrestored', () => r(), { once: true });
+      });
+      ext.loseContext();
+      await new Promise((r) => setTimeout(r, 60));
+      ext.restoreContext();
+      await Promise.race([done, new Promise((r) => setTimeout(r, 4000))]);
+      await new Promise((r) => setTimeout(r, 250));
+      restored = !gp.renderer.contextLost;
+    }
+    const afterLoss = restored ? measure() : null;
+    return { fresh, withAnchor, anchors, restored, afterLoss, keptAnchors: gp.app.anchors.length };
+  });
+
+  check(pixelExact.fresh.maxDelta === 0 && pixelExact.fresh.holeFrac === 0,
+    `home pose IS the photograph (max channel delta ${pixelExact.fresh.maxDelta})`);
+  check(pixelExact.anchors > 0, `a generated anchor exists (${pixelExact.anchors})`);
+  check(pixelExact.withAnchor.maxDelta === 0 && pixelExact.withAnchor.holeFrac === 0,
+    `still exact with a generated anchor committed (delta ${pixelExact.withAnchor.maxDelta})`);
+  if (pixelExact.restored) {
+    check(pixelExact.afterLoss.maxDelta === 0 && pixelExact.afterLoss.holeFrac === 0,
+      `still exact after a GPU context loss (delta ${pixelExact.afterLoss.maxDelta})`);
+    check(pixelExact.keptAnchors === pixelExact.anchors,
+      `generated anchors survive a context loss (${pixelExact.keptAnchors}/${pixelExact.anchors})`);
+  } else {
+    console.log('  (skipped: WEBGL_lose_context unavailable)');
+  }
+  await page.evaluate(() => {
+    window.__gp.renderer.clearAnchors();
+    window.__gp.app.anchors = [];
+    window.__gp.cam.reset();
+  });
+
+  // Orbiting opens real disocclusions, and they are DETECTED as such — the
+  // whole point of M9 is that a stretched silhouette wall reads as a hole
+  // rather than as confident geometry.
+  const orbitHoles = await page.evaluate(async () => {
+    const gp = window.__gp;
+    gp.cam.reset();
+    gp.cam.yaw = 0.22; gp.cam.pitch = 0.05; gp.cam._clamp();
+    gp.app.needsRender = true;
+    await new Promise((r) => setTimeout(r, 120));
+    return gp.probeHoles();
+  });
+  check(orbitHoles > 0.02, `orbit opens detectable holes (${orbitHoles.toFixed(3)})`);
+
+  // ...and generating an anchor closes them
+  const closed = await page.evaluate(async () => {
+    const gp = window.__gp;
+    const before = gp.probeHoles();
+    gp.requestExpand(true);
+    for (let i = 0; i < 200 && gp.app.expandInFlight; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    gp.renderer.anchors.forEach((a) => { a.weight = 1; });
+    gp.renderer.render(gp.renderState());
+    return { before, after: gp.probeHoles(), anchors: gp.app.anchors.length };
+  });
+  check(closed.anchors === 1, `an anchor was committed (${closed.anchors})`);
+  check(closed.after < closed.before * 0.4,
+    `generated anchor closes the holes (${closed.before.toFixed(3)} -> ${closed.after.toFixed(3)})`);
+  await page.evaluate(() => {
+    window.__gp.renderer.clearAnchors();
+    window.__gp.app.anchors = [];
+    window.__gp.cam.reset();
+  });
 
   // DoF changes pixels (focus pulled off-subject so blur has something to do)
   const sharp = await page.evaluate(() => {
@@ -195,6 +316,42 @@ try {
   });
   check(pngSize > 50000, `PNG capture encodes (${(pngSize / 1024).toFixed(0)} KB)`);
 
+  // Regression: a photo whose padded depth width is not a multiple of 4 bytes
+  // per half-float row (e.g. 431 px -> pad 43 -> 517 texels -> 1034 bytes).
+  // Before UNPACK_ALIGNMENT=1 the disparity upload failed silently and the
+  // whole frame read as far shell at the home pose.
+  const oddWidth = await page.evaluate(async () => {
+    const gp = window.__gp;
+    const c = document.createElement('canvas');
+    c.width = 431; c.height = 323;
+    const ctx = c.getContext('2d');
+    const grad = ctx.createLinearGradient(0, 0, 0, 323);
+    grad.addColorStop(0, '#4a7fb5'); grad.addColorStop(1, '#6b8e23');
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, 431, 323);
+    ctx.fillStyle = '#aaa'; ctx.fillRect(150, 120, 120, 203);
+    const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+    const id0 = gp.app.buildId;
+    gp.openBlob(blob);
+    for (let i = 0; i < 600; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      if (gp.app.buildId > id0 && gp.app.meta && gp.app.meta.phase === 'final' && gp.app.setupId === gp.app.buildId) break;
+    }
+    const m = gp.app.meta;
+    gp.cam.reset(); gp.app.needsRender = true;
+    await new Promise((r) => setTimeout(r, 100));
+    const st = gp.renderState();
+    const cap = gp.renderer.captureAnchorFrame({
+      ...st, cam: { R: st.cam.R, C: st.cam.C, K: st.cam.K }, trustBase: false, dofStrength: 0,
+    }, m.w, m.h);
+    let holes = 0;
+    for (let i = 0; i < cap.conf.length; i++) if (cap.conf[i] < 0.5) holes++;
+    return { pdw: m.pdw, holeFrac: holes / cap.conf.length };
+  });
+  check(oddWidth.pdw % 2 === 1 || (oddWidth.pdw * 2) % 4 !== 0,
+    `odd-width photo exercises the alignment path (pdw ${oddWidth.pdw})`);
+  check(oddWidth.holeFrac === 0,
+    `odd-width photo is fully confident at home (hole fraction ${oddWidth.holeFrac})`);
+
   // record shots
   fs.mkdirSync(path.join(root, 'e2e', 'out'), { recursive: true });
   const snap = async (name, setup) => {
@@ -216,9 +373,9 @@ try {
     gp.cam.reset(); gp.settings.aperture = 0;
     gp.app.targetFocus = gp.app.focusDist = 1;
   });
-  await snap('render-pan.png', (gp) => {
+  await snap('render-orbit-wide.png', (gp) => {
     gp.cam.reset(); gp.settings.aperture = 0;
-    gp.cam.ex = gp.cam.exyMax; gp.cam.ey = gp.cam.exyMax * 0.6;
+    gp.cam.yaw = 0.3; gp.cam.pitch = 0.14; gp.cam._clamp();
   });
   await snap('render-dof.png', (gp) => {
     gp.cam.reset(); gp.settings.aperture = 0.7;

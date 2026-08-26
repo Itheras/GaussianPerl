@@ -1,5 +1,7 @@
 // Tunables and per-device quality presets.
 
+import { hasWebGpuObject } from './backend/capabilities.js';
+
 export function isMobile() {
   const ua = navigator.userAgent || '';
   const touchMac = ua.includes('Macintosh') && navigator.maxTouchPoints > 2; // iPadOS
@@ -20,10 +22,16 @@ export function isSafariEngine() {
 
 export function defaultQuality() {
   if (isMobile()) return 'medium';
+  // Deliberately NOT keyed off a GPU memory budget. The tempting version
+  // ("lots of VRAM -> ultra") picks ultra on a 32 GB Mac and TRIPLES the
+  // working resolution (1.4 MP -> 4.2 MP) on the machine that also has to hold
+  // a multi-GB model — a memory regression introduced by a change whose stated
+  // purpose was memory awareness. Native builds opt into ultra explicitly.
   // modern desktop GPUs handle ~5M splats; webgpu presence is the proxy.
   // 4.2MP working res is display-limited on a 2x canvas — going higher only
   // burns memory without visible sharpness.
-  return navigator.gpu ? 'ultra' : 'high';
+  if (globalThis.__GP_NATIVE__) return 'high';
+  return hasWebGpuObject() ? 'ultra' : 'high';
 }
 
 // maxPixels: budget for the fine splat layer (≈ splat count before extras)
@@ -61,7 +69,13 @@ export const DEFAULTS = {
 // rewritten WebGPU runtime is current. v3 ships ONLY the JSEP wasm: unsafe on iOS.
 export const MODEL = {
   id: 'onnx-community/depth-anything-v2-small',
-  idHQ: 'onnx-community/depth-anything-v2-base', // sharper edges; desktop webgpu only
+  // Depth Anything V2 *base* and *large* are cc-by-nc-4.0 — NON-COMMERCIAL —
+  // while *small* is apache-2.0 (verified on the HF API). The base checkpoint
+  // has visibly sharper depth edges, but it was being tried FIRST on every
+  // desktop WebGPU machine, which quietly made the whole app non-commercial.
+  // Default to the permissive one; ?hq=1 opts in with eyes open.
+  idHQ: 'onnx-community/depth-anything-v2-small',
+  idHQNonCommercial: 'onnx-community/depth-anything-v2-base',
   cdn: 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0',
 };
 

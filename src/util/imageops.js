@@ -217,6 +217,42 @@ export function toHalfFloat(src) {
 // 3x3 min-filter, iterated — erodes NEAR (large) disparity values so fg
 // silhouettes shrink a hair and the photo's mixed-color rim lands on the
 // background side (Immersity's edge-alignment trick).
+/**
+ * Per-channel sensor-noise sigma, by Immerkaer's method: convolve with
+ *   [[1,-2,1],[-2,4,-2],[1,-2,1]]
+ * which annihilates any locally-linear signal, so what survives is noise, then
+ * take a ROBUST average of the magnitudes (the plain mean is dominated by
+ * edges, which the kernel does not annihilate). Returns sigma in 0..1 units.
+ *
+ * We need this because generated regions have to carry the SAME grain as the
+ * photograph. Grain is the single strongest tell: a region with no noise reads
+ * as plastic instantly, long before anyone notices the geometry is invented.
+ */
+export function estimateNoiseSigma(rgba, w, h) {
+  const out = [0, 0, 0];
+  if (w < 5 || h < 5) return out;
+  const n = (w - 2) * (h - 2);
+  const mags = new Float32Array(n);
+  for (let c = 0; c < 3; c++) {
+    let k = 0;
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const i = (y * w + x) * 4 + c;
+        const v = 4 * rgba[i]
+          - 2 * (rgba[i - 4] + rgba[i + 4] + rgba[i - w * 4] + rgba[i + w * 4])
+          + rgba[i - w * 4 - 4] + rgba[i - w * 4 + 4]
+          + rgba[i + w * 4 - 4] + rgba[i + w * 4 + 4];
+        mags[k++] = Math.abs(v);
+      }
+    }
+    // median, not mean: edges survive the kernel and would inflate the estimate
+    const med = percentile(mags, 0.5);
+    // |N(0,s)| has median 0.6745s; the kernel multiplies sigma by sqrt(36)=6
+    out[c] = Math.min(med / 0.6745 / 6 / 255, 0.25);
+  }
+  return out;
+}
+
 export function erodeMaxima(field, w, h, iterations = 2) {
   let cur = Float32Array.from(field);
   for (let it = 0; it < iterations; it++) {

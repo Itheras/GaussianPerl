@@ -19,6 +19,27 @@ import {
 import { intrinsicsFrom35mm, defaultIntrinsics, intrinsicsFromTags } from '../src/io/exif.js';
 import { fgsSmooth, weightedMedianDepth, mergeFloaters, relocateEdges } from '../src/pipeline/depth-filter.js';
 import { buildLayers, upsampleBackgroundTo } from '../src/pipeline/layer-build.js';
+import {
+  M3, camRotation, cameraBasis, rotationToYawPitch, rayDir, relativePose,
+  marchParams, uvAt, depthAt, poseDistance, intrinsicsK,
+} from '../src/render/pose.js';
+import {
+  robustAffine, pushPullFill, alignDisparity, holeMask, holeFraction,
+  holeFractionRect, trustAlpha, depthToDisparity, packAnchorColor,
+  clampHolesToBackground, splitHolesByArea, nearSideMask, mirrorFillRows, borderComponents,
+} from '../src/pipeline/novel-view.js';
+import { classicalComplete, anchorDepthDims, expandView } from '../src/pipeline/expand.js';
+import {
+  W as S_W, H as S_H, mkCam, mkAnchor, renderGT, renderFromAnchors, compare,
+  DSUB as S_DSUB, DFLOOR as S_DFLOOR,
+} from './scene3d.mjs';
+import {
+  anchorToPoints, crossViewConsistency, evaluatePointCandidate, selectPointCandidate,
+} from '../src/pipeline/points.js';
+import {
+  ScenePointMemory, POINT_PROMPT_SCHEMA, POINT_MEMORY_STATE, POINT_MEMORY_STATE_CODE,
+} from '../src/pipeline/point-prompt.js';
+import { NativeInpainter } from '../src/backend/native-fill.js';
 import { encodePNG } from '../tools/png.mjs';
 
 let passed = 0, failed = 0;
@@ -794,6 +815,615 @@ await test('pipeline-worker: classical layers final; AI fill falls back offline'
   }
 });
 
+
+
+// ---------------- M9: pose / multi-anchor march ----------------
+const rngFrom = (seed) => () => {
+  seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+  return seed / 0x7fffffff;
+};
+
+await test('pose: anchor uv is EXACTLY affine in disparity, for arbitrary 6-DoF', () => {
+  // brute force: unproject the novel ray, walk it to the point whose ANCHOR
+  // depth is dSub/d, project that point into the anchor. Must match uv0+d*slope.
+  const rnd = rngFrom(4242);
+  const rr = (a, b) => a + rnd() * (b - a);
+  const dSub = 0.42;
+  let worst = 0, n = 0;
+  for (let t = 0; t < 800; t++) {
+    const anchor = {
+      R: camRotation(rr(-1, 1), rr(-0.7, 0.7)),
+      C: [rr(-2, 2), rr(-2, 2), rr(-2, 2)],
+      K: [rr(0.5, 1.5), rr(0.5, 1.5)],
+    };
+    const novel = {
+      R: camRotation(rr(-1, 1), rr(-0.7, 0.7)),
+      C: [rr(-2, 2), rr(-2, 2), rr(-2, 2)],
+      K: [rr(0.5, 1.5), rr(0.5, 1.5)],
+    };
+    const uv = [rr(0, 1), rr(0, 1)];
+    const dir = rayDir(uv, novel.K);
+    const { m, c } = relativePose(anchor, novel);
+    const p = marchParams(m, c, anchor.K, dir, dSub, 1);
+    if (!p) continue;
+    const d = rr(0.08, 1);
+    const zeta = dSub / d;
+    const vWorld = M3.mulVecT(novel.R, dir);
+    const cA = M3.mulVec(anchor.R, [
+      novel.C[0] - anchor.C[0], novel.C[1] - anchor.C[1], novel.C[2] - anchor.C[2]]);
+    const vA = M3.mulVec(anchor.R, vWorld);
+    const sBrute = (-cA[2] - zeta) / vA[2];
+    const P = [cA[0] + sBrute * vA[0], cA[1] + sBrute * vA[1], cA[2] + sBrute * vA[2]];
+    const bu = 0.5 + anchor.K[0] * (P[0] / zeta);
+    const bv = 0.5 - anchor.K[1] * (P[1] / zeta);
+    const [au, av] = uvAt(p, d);
+    worst = Math.max(worst, Math.abs(au - bu), Math.abs(av - bv));
+    // and the ray parameter IS the novel-frame depth (dir.z is exactly -1)
+    worst = Math.max(worst, Math.abs(depthAt(p, d) - sBrute));
+    // E.z == 0, F.z == -1 exactly
+    near(p.E[2], 0, 1e-6);
+    near(p.F[2], -1, 1e-6);
+    n++;
+  }
+  assert.ok(n > 500, `enough non-grazing samples (${n})`);
+  assert.ok(worst < 1e-4, `affine identity holds (worst ${worst})`);
+});
+
+await test('pose: at rest the mapping is the identity — the photo stays pixel-exact', () => {
+  const rnd = rngFrom(99);
+  const rr = (a, b) => a + rnd() * (b - a);
+  for (let t = 0; t < 100; t++) {
+    const pose = {
+      R: camRotation(rr(-1, 1), rr(-0.6, 0.6)),
+      C: [rr(-3, 3), rr(-3, 3), rr(-3, 3)],
+      K: [rr(0.5, 1.5), rr(0.5, 1.5)],
+    };
+    const uv = [rr(0.05, 0.95), rr(0.05, 0.95)];
+    const { m, c } = relativePose(pose, pose);
+    const p = marchParams(m, c, pose.K, rayDir(uv, pose.K), 0.4, 1);
+    near(p.slope[0], 0, 1e-9);
+    near(p.slope[1], 0, 1e-9);
+    const [u, v] = uvAt(p, rr(0.05, 1));
+    near(u, uv[0], 1e-6);
+    near(v, uv[1], 1e-6);
+  }
+});
+
+await test('pose: grazing rays are rejected; s>=0 clamps the near end of the march', () => {
+  // a ray parallel to the anchor image plane must be refused outright
+  const anchor = { R: M3.identity(), C: [0, 0, 0], K: [1, 1] };
+  const side = { R: camRotation(Math.PI / 2, 0), C: [0, 0, -1], K: [1, 1] };
+  const { m, c } = relativePose(anchor, side);
+  assert.equal(marchParams(m, c, anchor.K, rayDir([0.5, 0.5], side.K), 0.4, 1), null);
+
+  // dollying forward puts the camera in front of the anchor: every sample
+  // nearer than the camera itself is behind the eye and must be clipped away
+  const fwd = { R: M3.identity(), C: [0, 0, -0.5], K: [1, 1] };
+  const rel = relativePose(anchor, fwd);
+  const p = marchParams(rel.m, rel.c, anchor.K, rayDir([0.5, 0.5], fwd.K), 0.4, 1);
+  assert.ok(p.dStart < 1, `march start clamped (${p.dStart})`);
+  near(depthAt(p, p.dStart), 0, 1e-6);        // exactly at the eye
+  assert.ok(depthAt(p, p.dStart * 0.5) > 0, 'everything past it is in front');
+});
+
+await test('pose: yaw/pitch round-trip and poseDistance ordering', () => {
+  const { yaw, pitch } = rotationToYawPitch(camRotation(0.7, -0.3));
+  near(yaw, 0.7, 1e-5);
+  near(pitch, -0.3, 1e-5);
+  const b = cameraBasis(0, 0);
+  near(b.forward[2], -1, 1e-9);
+  near(b.right[0], 1, 1e-9);
+  near(b.up[1], 1, 1e-9);
+  const home = { R: camRotation(0, 0), C: [0, 0, 0] };
+  const near1 = { R: camRotation(0.05, 0), C: [0.05, 0, 0] };
+  const far1 = { R: camRotation(0.5, 0), C: [0.8, 0, 0] };
+  assert.ok(poseDistance(home, near1) < poseDistance(home, far1), 'closer pose ranks first');
+  near(poseDistance(home, home), 0, 1e-9);
+  const k = intrinsicsK(800, 1000, 500);
+  near(k[0], 0.8); near(k[1], 1.6);
+});
+
+// ---------------- M9: novel-view completion ----------------
+await test('novel-view: robust affine recovers scale+shift and survives outliers', () => {
+  const n = 4000;
+  const est = new Float32Array(n), ref = new Float32Array(n);
+  const mask = new Uint8Array(n).fill(1);
+  const rnd = rngFrom(7);
+  for (let i = 0; i < n; i++) {
+    est[i] = rnd();
+    ref[i] = 0.37 * est[i] - 0.11 + (rnd() - 0.5) * 0.004;
+  }
+  // 12% gross outliers, the stretched-wall pixels the reference is full of
+  for (let i = 0; i < n * 0.12; i++) ref[(i * 7) % n] = rnd() * 3 - 1;
+  const fit = robustAffine(est, ref, mask);
+  near(fit.a, 0.37, 0.02);
+  near(fit.b, -0.11, 0.02);
+  assert.ok(Number.isFinite(fit.mad), 'reports a robust residual');
+});
+
+await test('novel-view: alignment is exact where known and continuous across the hole', () => {
+  const w = 96, h = 64, n = w * h;
+  const truth = new Float32Array(n), est = new Float32Array(n);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) truth[y * w + x] = 0.2 + 0.5 * (y / h) + 0.1 * (x / w);
+  }
+  for (let i = 0; i < n; i++) est[i] = (truth[i] + 0.3) / 0.45;
+  const known = new Uint8Array(n).fill(1);
+  const ref = Float32Array.from(truth);
+  for (let y = 20; y < 44; y++) {
+    for (let x = 40; x < 76; x++) { known[y * w + x] = 0; ref[y * w + x] = 0; }
+  }
+  const { disp, fit } = alignDisparity({ est, ref, known, w, h });
+  near(fit.a, 0.45, 0.01);
+  for (let i = 0; i < n; i++) {
+    if (known[i]) near(disp[i], ref[i], 1e-6);
+    else near(disp[i], truth[i], 0.01);
+  }
+  // no step at the boundary
+  const yMid = 32 * w;
+  near(disp[yMid + 39], disp[yMid + 40], 0.01);
+  near(disp[yMid + 75], disp[yMid + 76], 0.01);
+});
+
+await test('novel-view: alignment falls back rather than inverting the scene', () => {
+  const n = 400;
+  const est = new Float32Array(n), ref = new Float32Array(n);
+  const mask = new Uint8Array(n).fill(1);
+  for (let i = 0; i < n; i++) { est[i] = i / n; ref[i] = 1 - i / n; } // negative slope
+  const fit = robustAffine(est, ref, mask);
+  assert.equal(fit.method, 'percentile');
+  assert.ok(fit.a > 0, 'never emits a negative or zero scale');
+});
+
+await test('novel-view: push-pull preserves constants and does not leave 2x2 blocks', () => {
+  const w = 64, h = 64, n = w * h;
+  const v = new Float32Array(n).fill(2.5);
+  const known = new Uint8Array(n);
+  for (let i = 0; i < n; i += 53) known[i] = 1;
+  const out = pushPullFill(v, known, w, h);
+  for (let i = 0; i < n; i++) near(out[i], 2.5, 1e-5);
+
+  // a linear ramp known only on the left half must extend smoothly, and
+  // neighbouring pixels must not sit in flat 2x2 plateaus (the nearest-pull
+  // signature)
+  const ramp = new Float32Array(n);
+  const k2 = new Uint8Array(n);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      ramp[y * w + x] = x / w;
+      if (x < w / 2) k2[y * w + x] = 1;
+    }
+  }
+  // A nearest pull stamps each coarse texel over its 2x2 children, so the
+  // extension comes out as a staircase; bilinear leaves it smooth. Curvature
+  // is the test — far from any data the field correctly relaxes to a constant,
+  // so counting flat neighbours would flag correct behaviour as a defect.
+  const filled = pushPullFill(ramp, k2, w, h);
+  let maxCurve = 0;
+  for (let y = 2; y < h - 2; y++) {
+    for (let x = w / 2 + 2; x < w - 2; x++) {
+      const i = y * w + x;
+      maxCurve = Math.max(maxCurve,
+        Math.abs(filled[i - 1] - 2 * filled[i] + filled[i + 1]),
+        Math.abs(filled[i - w] - 2 * filled[i] + filled[i + w]));
+    }
+  }
+  assert.ok(maxCurve < 0.02, `extension is smooth, not a staircase (${maxCurve.toExponential(2)})`);
+  // and it continues the data rather than jumping at the boundary
+  const row = 32 * w;
+  assert.ok(Math.abs(filled[row + w / 2 - 1] - filled[row + w / 2]) < 0.1, 'no step at the seam');
+});
+
+await test('novel-view: hole mask, rect-restricted fraction, and trust alpha', () => {
+  const w = 40, h = 20, n = w * h;
+  const conf = new Float32Array(n).fill(1);
+  for (let y = 8; y < 12; y++) for (let x = 2; x < 6; x++) conf[y * w + x] = 0.1;
+  const m = holeMask(conf, w, h, { threshold: 0.5, dilate: 0 });
+  assert.equal(m[9 * w + 3], 1);
+  assert.equal(m[0], 0);
+  const grown = holeMask(conf, w, h, { threshold: 0.5, dilate: 2 });
+  assert.ok(grown.reduce((a, b) => a + b, 0) > m.reduce((a, b) => a + b, 0), 'dilate grows it');
+  near(holeFraction(conf, 0.5), 16 / n, 1e-9);
+  // the same holes sit outside a 25% inset, so the visible-frame trigger is calm
+  assert.ok(holeFractionRect(conf, w, h, 0.25, 0.5) < holeFraction(conf, 0.5));
+
+  const holes = new Uint8Array(n);
+  for (let y = 8; y < 12; y++) for (let x = 18; x < 24; x++) holes[y * w + x] = 1;
+  const alpha = trustAlpha(holes, w, h, { keep: 0.8, featherPx: 1, borderPx: 3 });
+  near(alpha[10 * w + 21], 1, 0.05);           // generated: fully valid
+  assert.ok(alpha[10 * w + 34] > 0.55, 're-rendered content stays above CONF_OK');
+  near(alpha[0], 0, 1e-6);                      // frame corner feathers to nothing
+});
+
+await test('novel-view: depth->disparity and anchor colour packing', () => {
+  const d = depthToDisparity(new Float32Array([1, 2, 0.5, 0, NaN]), 0.4, 0.04);
+  near(d[0], 0.4); near(d[1], 0.2); near(d[2], 0.8);
+  near(d[3], 0.04); near(d[4], 0.04);
+  const rgba = new Uint8ClampedArray([10, 20, 30, 255, 40, 50, 60, 255]);
+  const packed = packAnchorColor(rgba, new Float32Array([1, 0.5]), 2, 1);
+  assert.equal(packed[3], 255);
+  assert.equal(packed[7], 128);
+  assert.equal(packed[4], 40);
+});
+
+await test('expand: classical completion fills holes, never touches known pixels', () => {
+  const w = 48, h = 32, n = w * h;
+  const rgba = new Uint8ClampedArray(n * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      rgba[i] = 200; rgba[i + 1] = 60; rgba[i + 2] = 20; rgba[i + 3] = 255;
+    }
+  }
+  const holes = new Uint8Array(n);
+  for (let y = 10; y < 22; y++) for (let x = 14; x < 30; x++) holes[y * w + x] = 1;
+  // garbage inside the hole, the way a stretched wall is garbage
+  for (let i = 0; i < n; i++) {
+    if (holes[i]) { rgba[i * 4] = 0; rgba[i * 4 + 1] = 255; rgba[i * 4 + 2] = 255; }
+  }
+  const out = classicalComplete(rgba, holes, w, h, 6);
+  assert.equal(out[0], 200);
+  assert.equal(out[1], 60);
+  const c = (16 * w + 22) * 4;
+  assert.ok(Math.abs(out[c] - 200) < 12 && Math.abs(out[c + 1] - 60) < 12,
+    `hole takes the surrounding colour (${out[c]},${out[c + 1]},${out[c + 2]})`);
+  const dims = anchorDepthDims(1600, 1200, 480000);
+  assert.ok(dims.dw * dims.dh <= 480000 * 1.02, `depth dims budgeted (${dims.dw}x${dims.dh})`);
+  near(dims.dw / dims.dh, 1600 / 1200, 0.02);
+});
+
+
+await test('novel-view: a disocclusion is forced to background depth, a plain gap is not', () => {
+  const w = 64, h = 48, n = w * h;
+  // left half near (a foreground object), right half far (background)
+  const disp = new Float32Array(n);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) disp[y * w + x] = x < 30 ? 0.9 : 0.2;
+  }
+  const holes = new Uint8Array(n);
+  // a disocclusion straddling the cliff, filled by a model with a RAMP
+  for (let y = 12; y < 36; y++) {
+    for (let x = 28; x < 40; x++) {
+      const i = y * w + x;
+      holes[i] = 1;
+      disp[i] = 0.9 - 0.7 * ((x - 28) / 12);   // the smear-producing ramp
+    }
+  }
+  const out = clampHolesToBackground(disp, holes, w, h, { jump: 0.055 });
+  assert.ok(out.clamped > 100, `the ramp was clamped (${out.clamped} px)`);
+  for (let y = 12; y < 36; y++) {
+    for (let x = 28; x < 40; x++) {
+      assert.ok(out.disp[y * w + x] <= 0.2 + 0.02 + 1e-6,
+        `hole sits at background depth (${out.disp[y * w + x].toFixed(3)})`);
+    }
+  }
+  // known pixels are never touched
+  near(out.disp[5 * w + 5], 0.9, 1e-6);
+  near(out.disp[5 * w + 50], 0.2, 1e-6);
+
+  // a hole whose rim is all at ONE depth has no cliff: leave the model alone
+  const flat = new Float32Array(n).fill(0.5);
+  const h2 = new Uint8Array(n);
+  for (let y = 20; y < 28; y++) for (let x = 20; x < 28; x++) { h2[y * w + x] = 1; flat[y * w + x] = 0.77; }
+  const out2 = clampHolesToBackground(flat, h2, w, h, { jump: 0.055 });
+  assert.equal(out2.clamped, 0, 'no cliff on the rim, nothing clamped');
+  near(out2.disp[24 * w + 24], 0.77, 1e-6);
+});
+
+await test('novel-view: holes split by component area', () => {
+  const w = 64, h = 48, n = w * h;
+  const holes = new Uint8Array(n);
+  for (let y = 10; y < 30; y++) for (let x = 10; x < 40; x++) holes[y * w + x] = 1; // 600 px
+  for (let y = 40; y < 43; y++) for (let x = 50; x < 53; x++) holes[y * w + x] = 1;  // 9 px
+  const { large, small, components } = splitHolesByArea(holes, w, h, 50);
+  assert.equal(components, 2);
+  assert.equal(large.reduce((a, b) => a + b, 0), 600);
+  assert.equal(small.reduce((a, b) => a + b, 0), 9);
+  assert.equal(large[41 * w + 51], 0);
+  assert.equal(small[41 * w + 51], 1);
+});
+
+await test('pipeline: the orbit pivot is the near subject, not the frame centre', async () => {
+  const { subjectDisparity } = await import('../src/pipeline/pipeline-worker.js');
+  const w = 120, h = 90;
+  // far water everywhere (0.14), a person-sized near slab at the right edge (0.95)
+  const disp = new Float32Array(w * h).fill(0.14);
+  for (let y = 30; y < 85; y++) for (let x = 85; x < 115; x++) disp[y * w + x] = 0.95;
+  const d = subjectDisparity(disp, w, h);
+  assert.ok(d > 0.9, `pivots on the person (${d.toFixed(3)})`);
+  // a flat scene keeps the centre rule
+  const flat = new Float32Array(w * h).fill(0.4);
+  near(subjectDisparity(flat, w, h), 0.4, 1e-3);
+});
+
+await test('novel-view: the near side of a disocclusion is found, the far side is not', () => {
+  const w = 64, h = 48, n = w * h;
+  const disp = new Float32Array(n);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) disp[y * w + x] = x < 28 ? 0.9 : 0.2; // near | far
+  const holes = new Uint8Array(n);
+  for (let y = 10; y < 38; y++) for (let x = 28; x < 36; x++) holes[y * w + x] = 1;   // band at the cliff
+  const near = nearSideMask(disp, holes, w, h, { jump: 0.055, radius: 6 });
+  assert.equal(near[20 * w + 25], 1, 'occluder pixels beside the hole are near-side');
+  assert.equal(near[20 * w + 40], 0, 'background pixels beside the hole are not');
+  assert.equal(near[20 * w + 10], 0, 'beyond the radius nothing is marked');
+  assert.equal(near[20 * w + 30], 0, 'hole pixels themselves are not marked');
+});
+
+await test('expand: a failing sidecar falls back to the in-browser model, not to blur', async () => {
+  const w = 96, h = 64, n = w * h;
+  const rgba = new Uint8ClampedArray(n * 4);
+  const conf = new Float32Array(n).fill(1);
+  const refDisp = new Float32Array(n);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const near = x < 40;
+      rgba[i * 4] = near ? 200 : 20; rgba[i * 4 + 1] = near ? 30 : 180; rgba[i * 4 + 2] = 40; rgba[i * 4 + 3] = 255;
+      refDisp[i] = near ? 0.9 : 0.2;
+    }
+  }
+  for (let y = 10; y < 54; y++) for (let x = 40; x < 64; x++) conf[y * w + x] = 0.1; // a disocclusion band
+  const sidecar = { backend: 'sidecar', fill: async () => { throw new Error('sidecar 500'); } };
+  const fallback = {
+    backend: 'wasm',
+    fill: async ({ rgba: src, holes, w: fw }) => {
+      const filled = new Uint8ClampedArray(src);
+      const genMask = new Uint8Array(holes);
+      // textured, because the MI-GAN path deliberately anchors LOW frequencies
+      // to the classical seed — a flat fill would come back as the seed colour
+      for (let i = 0; i < holes.length; i++) {
+        if (!holes[i]) continue;
+        const chk = (((i % fw) >> 1) + ((i / fw | 0) >> 1)) & 1;
+        filled[i * 4] = chk ? 255 : 0; filled[i * 4 + 1] = chk ? 0 : 255; filled[i * 4 + 2] = chk ? 255 : 0;
+      }
+      return { filled, genMask, plate: null, plateInit: null, ring: null, pw: 0, ph: 0 };
+    },
+  };
+  const out = await expandView({ rgba, conf, refDisp, w, h, params: { confThreshold: 0.6 } },
+    { inpainter: sidecar, fallback: async () => fallback });
+  assert.ok(out, 'an anchor was produced');
+  assert.equal(out.stats.fillKind, 'ai');
+  assert.equal(out.stats.fillBackend, 'wasm');
+  // the hole carries the fallback model's texture (the seed is smooth)
+  let s1 = 0, s2 = 0, k = 0;
+  for (let y = 20; y < 44; y++) for (let x = 44; x < 60; x++) { const v = out.color[(y * w + x) * 4]; s1 += v; s2 += v * v; k++; }
+  const std = Math.sqrt(Math.max(s2 / k - (s1 / k) ** 2, 0));
+  assert.ok(std > 40, `hole carries the fallback model's texture (std ${std.toFixed(1)})`);
+  // the occluder's rim (collar: masked for the model, never kept) is still
+  // the photograph, not the seed blur. x=38 is inside the 2 px seed dilation
+  // and legitimately repainted; x=36 is collar only.
+  const j = 30 * w + 36;
+  assert.equal(out.color[j * 4], 200);
+});
+
+await test('novel-view: row-wise mirror fill continues texture from both sides', () => {
+  const w = 40, h = 3, n = w * h;
+  const rgba = new Uint8ClampedArray(n * 4);
+  const mask = new Uint8Array(n);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    rgba[i * 4] = x * 6; rgba[i * 4 + 1] = 100; rgba[i * 4 + 2] = (x % 2) ? 255 : 0; rgba[i * 4 + 3] = 255;
+    if (x >= 15 && x < 25) mask[i] = 1;
+  }
+  const out = mirrorFillRows(rgba, mask, w, h);
+  // known pixels untouched
+  assert.equal(out[(1 * w + 10) * 4], 60);
+  // first masked pixel next to the left edge mirrors x=13 (weight dominated by the near side)
+  const i15 = (1 * w + 15) * 4;
+  assert.ok(Math.abs(out[i15] - 13 * 6) < 30, `mirrors the near side (${out[i15]})`);
+  // texture (the alternating blue) survives inside the fill
+  const blues = [];
+  for (let x = 16; x < 24; x++) blues.push(out[(1 * w + x) * 4 + 2]);
+  const spread = Math.max(...blues) - Math.min(...blues);
+  assert.ok(spread > 100, `high-frequency texture continues (${spread})`);
+});
+
+await test('novel-view: border components are told apart from interior disocclusions', () => {
+  const w = 64, h = 48, n = w * h;
+  const holes = new Uint8Array(n);
+  for (let y = 10; y < 30; y++) for (let x = 20; x < 30; x++) holes[y * w + x] = 1;  // interior
+  for (let y = 0; y < 48; y++) for (let x = 56; x < 64; x++) holes[y * w + x] = 1;    // touches the edge
+  const b = borderComponents(holes, w, h, 2);
+  assert.equal(b[20 * w + 25], 0, 'interior component excluded');
+  assert.equal(b[20 * w + 60], 1, 'border component included');
+});
+
+// ---------- M9: does the anchor representation support walking behind things ----------
+// Analytic 3D scene, exact ground truth, CPU mirror of the shader's march.
+// This is the architectural claim the whole "see a person's back" idea rests
+// on: the renderer does not need to change for it, only the generator does.
+await test('anchors: rest pose reproduces the source view exactly', () => {
+  const cam = mkCam([0, 0, 0], 0);
+  const anchor = mkAnchor(cam, 160, 120);
+  const out = renderFromAnchors([anchor], cam, 160, 120);
+  const gt = renderGT(cam, 160, 120);
+  const { coverage, meanAbsErr } = compare(out, gt, 160, 120);
+  near(coverage, 1, 1e-9);
+  near(meanAbsErr, 0, 1e-9);
+});
+
+await test('anchors: a view from behind is UNEXPLAINED, not invented', () => {
+  // the photograph faces the subject; a camera behind it must report total
+  // ignorance rather than confidently smearing the front around the back
+  const photo = mkAnchor(mkCam([0, 0, 0], 0));
+  const behindCam = mkCam([0.55, 0.12, -5.0], Math.PI - 0.16, -0.03);
+  const out = renderFromAnchors([photo], behindCam, S_W, S_H);
+  const { coverage } = compare(out, renderGT(behindCam, S_W, S_H), S_W, S_H);
+  assert.ok(coverage < 0.02, `nothing is claimed from behind (coverage ${coverage.toFixed(3)})`);
+});
+
+await test('anchors: ONE generated view from behind makes that side renderable', () => {
+  const photo = mkAnchor(mkCam([0, 0, 0], 0));
+  // a generated anchor, as an image-to-3D model would supply it
+  const generated = mkAnchor(mkCam([0, 0, -5.4], Math.PI));
+  // ...and a test camera that is NOT at the generated pose: offset 0.55 units,
+  // rotated ~9 degrees, pitched. So this is genuine novel-view synthesis from
+  // the anchor, not playback of it.
+  const cam = mkCam([0.55, 0.12, -5.0], Math.PI - 0.16, -0.03);
+  const gt = renderGT(cam, S_W, S_H);
+  const out = renderFromAnchors([photo, generated], cam, S_W, S_H);
+  const { coverage, meanAbsErr } = compare(out, gt, S_W, S_H);
+  assert.ok(coverage > 0.5, `the far side becomes renderable (coverage ${coverage.toFixed(3)})`);
+  assert.ok(meanAbsErr < 0.05,
+    `and it matches the true scene (mean abs err ${meanAbsErr.toFixed(4)} on 0..1)`);
+});
+
+
+// ---------- M11: the scene as an explicit world-space point cloud ----------
+// The bridge any generative-point-cloud direction needs: serialise anchors to
+// world points (the guesser's CONTEXT) and measure cross-view agreement.
+await test('points: unprojection is self-exact', () => {
+  const A = mkAnchor(mkCam([0, 0, 0], 0));
+  const pts = anchorToPoints(A, { dSub: S_DSUB, dFloor: S_DFLOOR, edgeJump: 0.05 });
+  assert.ok(pts.count > 20000, `a dense cloud came out (${pts.count})`);
+  const self = crossViewConsistency(pts.positions, A, { dSub: S_DSUB, tol: 0.005 });
+  near(self.matchedFrac, 1, 1e-9);
+  assert.equal(self.floating, 0);
+});
+
+await test('points: cross-view agreement under a wide baseline; cliff filter kills floaters', () => {
+  const A = mkAnchor(mkCam([0, 0, 0], 0));
+  const B = mkAnchor(mkCam([0.9, 0.15, -0.8], 0.45, -0.05));
+  const raw = anchorToPoints(A, { dSub: S_DSUB, dFloor: S_DFLOOR, edgeJump: 0 });
+  const filt = anchorToPoints(A, { dSub: S_DSUB, dFloor: S_DFLOOR, edgeJump: 0.05 });
+  const cRaw = crossViewConsistency(raw.positions, B, { dSub: S_DSUB, tol: 0.02 });
+  const cFilt = crossViewConsistency(filt.positions, B, { dSub: S_DSUB, tol: 0.02 });
+  assert.ok(cFilt.matchedFrac > 0.9, `mutually visible surfaces agree (${cFilt.matchedFrac.toFixed(3)})`);
+  assert.ok(cFilt.floatingFrac < 0.005,
+    `almost nothing floats in mid-air (${cFilt.floatingFrac.toFixed(4)})`);
+  assert.ok(cFilt.floatingFrac < cRaw.floatingFrac,
+    'dropping silhouette-cliff texels reduces floaters');
+});
+
+await test('points: a front anchor never contradicts a view from behind', () => {
+  // front-surface points seen from BEHIND must be occluded or matched — a
+  // floater here would mean the cloud claims matter where the back view sees
+  // through, which is exactly what a generative guesser must never add
+  const A = mkAnchor(mkCam([0, 0, 0], 0));
+  const BEHIND = mkAnchor(mkCam([0, 0, -5.4], Math.PI));
+  const pts = anchorToPoints(A, { dSub: S_DSUB, dFloor: S_DFLOOR, edgeJump: 0.05 });
+  const c = crossViewConsistency(pts.positions, BEHIND, { dSub: S_DSUB, tol: 0.02 });
+  assert.ok(c.tested > 3000, `a real overlap exists (${c.tested})`);
+  assert.equal(c.floating, 0, 'zero floating points against the opposite view');
+  assert.ok(c.occluded > 1000, `front surfaces are correctly hidden from behind (${c.occluded})`);
+});
+
+await test('point prompt: committed memory survives residency and carries the camera query', () => {
+  const photo = mkAnchor(mkCam([0, 0, 0], 0));
+  const sidePose = mkCam([0.9, 0.15, -0.8], 0.45, -0.05);
+  const side = mkAnchor(sidePose);
+  const memory = new ScenePointMemory();
+  const photoEntry = memory.commit(photo, { observed: true, provenance: 'photo', uncertainty: 0 });
+  const sideEntry = memory.commit(side, { provenance: 'sample-2', uncertainty: 0.25 });
+  // A renderer may evict either GPU texture. Scene memory has no residency
+  // operation, so both committed facts remain available to the guesser.
+  assert.equal(memory.size, 2);
+  assert.equal(memory.get(photoEntry.id), photoEntry);
+  assert.equal(memory.retrieve(sidePose, 1)[0], sideEntry, 'camera-overlap retrieval prefers the side view');
+
+  const prompt = memory.buildPrompt(sidePose, {
+    maxAnchors: 2, maxPoints: 1000, stride: 2,
+    dSub: S_DSUB, dFloor: S_DFLOOR, edgeJump: 0.05,
+  });
+  assert.equal(prompt.schema, POINT_PROMPT_SCHEMA);
+  assert.equal(prompt.count, 1000, 'the point context obeys its token budget');
+  assert.equal(prompt.positions.length, 3000);
+  assert.equal(prompt.colors.length, 4000);
+  assert.equal(prompt.sourceIds.length, 1000);
+  assert.equal(prompt.target.R.length, 9);
+  assert.equal(prompt.target.C.length, 3);
+  assert.equal(prompt.anchors.length, 2);
+  assert.ok(prompt.observed.some((x) => x === 1), 'photo provenance survives serialisation');
+  assert.ok(prompt.uncertainty.some((x) => x > 0), 'sample uncertainty survives serialisation');
+  assert.ok(prompt.states.some((x) => x === POINT_MEMORY_STATE_CODE.speculative),
+    'speculative state survives serialisation');
+  const trusted = memory.retrieve(sidePose, 4, {
+    states: [POINT_MEMORY_STATE.SOURCE, POINT_MEMORY_STATE.CONFIRMED],
+  });
+  assert.deepEqual(trusted, [photoEntry], 'speculative branches are not trusted witnesses');
+});
+
+await test('point prompt: real anchor color/depth resolutions and per-point trust survive', () => {
+  const pose = mkCam([0, 0, 0], 0);
+  const disp = new Float32Array(4).fill(0.5);
+  const color = new Uint8Array([
+    255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 64, 255, 255, 255, 0,
+  ]);
+  const memory = new ScenePointMemory();
+  memory.commit({ ...pose, disp, w: 2, h: 2, color, colorW: 4, colorH: 1 }, {
+    id: 'generated:uuid', provenance: 'test-generator', uncertainty: 0.1,
+  });
+  const prompt = memory.buildPrompt(pose, { maxPoints: 4, stride: 1, edgeJump: 0 });
+  assert.equal(prompt.count, 4);
+  assert.equal(prompt.anchors[0].id, 'generated:uuid', 'external IDs remain lossless in the header');
+  assert.equal(prompt.anchors[0].sourceId, 1, 'binary point IDs are dense integers');
+  assert.deepEqual(Array.from(prompt.sourceIds), [1, 1, 1, 1]);
+  assert.ok(prompt.uncertainty[1] > 0.45, 'transparent source texels increase point uncertainty');
+  assert.ok(prompt.uncertainty[3] > 0.95, 'zero-trust source texels stay explicitly uncertain');
+});
+
+await test('point guard: emptiness and a known-surface copy cannot masquerade as completion', () => {
+  const photo = mkAnchor(mkCam([0, 0, 0], 0));
+  const empty = evaluatePointCandidate(new Float32Array(), [photo], { dSub: S_DSUB });
+  assert.equal(empty.accepted, false);
+  assert.ok(empty.reasons.includes('insufficient-points'));
+  assert.ok(empty.reasons.includes('no-coverage-gain'));
+
+  const known = anchorToPoints(photo, {
+    dSub: S_DSUB, dFloor: S_DFLOOR, edgeJump: 0.05, stride: 2,
+  });
+  const copy = evaluatePointCandidate(known.positions, [photo], { dSub: S_DSUB, tol: 0.02 });
+  assert.equal(copy.accepted, false);
+  assert.ok(copy.reasons.includes('no-coverage-gain'));
+  near(copy.supportFraction, 1, 1e-9);
+});
+
+await test('point guard: a coherent wide-baseline completion passes and floating geometry refuses', () => {
+  const photo = mkAnchor(mkCam([0, 0, 0], 0));
+  const side = mkAnchor(mkCam([0.9, 0.15, -0.8], 0.45, -0.05));
+  const goodPoints = anchorToPoints(side, {
+    dSub: S_DSUB, dFloor: S_DFLOOR, edgeJump: 0.05, stride: 2,
+  }).positions;
+  const good = evaluatePointCandidate(goodPoints, [photo], { dSub: S_DSUB, tol: 0.02 });
+  assert.equal(good.accepted, true, good.reasons.join(', '));
+  assert.ok(good.supported > 2000, `known overlap anchors the sample (${good.supported})`);
+  assert.ok(good.novel > 1000, `the sample adds genuine coverage (${good.novel})`);
+
+  const floating = Float32Array.from(anchorToPoints(photo, {
+    dSub: S_DSUB, dFloor: S_DFLOOR, edgeJump: 0.05, stride: 2,
+  }).positions);
+  for (let i = 2; i < floating.length; i += 3) floating[i] += 0.35;
+  const bad = evaluatePointCandidate(floating, [photo], { dSub: S_DSUB, tol: 0.02 });
+  assert.equal(bad.accepted, false);
+  assert.ok(bad.reasons.includes('geometry-contradiction'));
+  assert.ok(bad.contradictionFraction > 0.1,
+    `the witness sees through the proposed floaters (${bad.contradictionFraction.toFixed(3)})`);
+});
+
+await test('point guard: stochastic hypotheses are selected, never averaged', () => {
+  const photo = mkAnchor(mkCam([0, 0, 0], 0));
+  const side1 = anchorToPoints(mkAnchor(mkCam([0.8, 0.12, -0.7], 0.4, -0.04)), {
+    dSub: S_DSUB, dFloor: S_DFLOOR, edgeJump: 0.05, stride: 2,
+  }).positions;
+  const side2 = anchorToPoints(mkAnchor(mkCam([-0.8, 0.12, -0.7], -0.4, -0.04)), {
+    dSub: S_DSUB, dFloor: S_DFLOOR, edgeJump: 0.05, stride: 2,
+  }).positions;
+  const candidates = [
+    { id: 'left', positions: side1, uncertainty: 0.4 },
+    { id: 'right', positions: side2, uncertainty: 0.1 },
+  ];
+  const picked = selectPointCandidate(candidates, [photo], { dSub: S_DSUB, tol: 0.02 });
+  assert.equal(picked.accepted, true);
+  assert.ok(picked.chosen === candidates[0] || picked.chosen === candidates[1]);
+  assert.ok(picked.chosen.positions === side1 || picked.chosen.positions === side2,
+    'the chosen cloud is an original coherent hypothesis, not an averaged cloud');
+});
+
+
+await test('native-fill: probe degrades to null without a sidecar, never throws', async () => {
+  assert.equal(await NativeInpainter.probe(null), null);
+  assert.equal(await NativeInpainter.probe({ url: 'http://127.0.0.1:1', token: 'x' }, 300), null);
+});
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
