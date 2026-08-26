@@ -2,10 +2,32 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "gaussianperl",
+      "name": "jobaligned-preview",
       "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "http.server", "8931"],
-      "port": 8931
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "8777",
+        "--directory",
+        "/Users/snow/Documents/GitHub/JobAligned/.preview"
+      ],
+      "port": 8777
+    },
+    {
+      "name": "viewer",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": [
+        "--dir",
+        "/Users/snow/Documents/GitHub/JobAligned/packages/viewer",
+        "exec",
+        "vite",
+        "--config",
+        "vite.config.mts",
+        "--port",
+        "5178",
+        "--strictPort"
+      ],
+      "port": 5178
     }
   ]
 }
